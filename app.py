@@ -13,58 +13,73 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-# ================= STOP CONTROL =================
+# =========================================================
+# Streamlit Config
+# =========================================================
+st.set_page_config(page_title="TataCliq Crawler", layout="wide")
+
+
+# =========================================================
+# Stop Control (Thread Safe)
+# =========================================================
 stop_event = threading.Event()
 
 def request_stop():
     stop_event.set()
 
 
-# ================= HEADERS =================
-# NOTE: Cookie is mandatory in many cases for TataCliq
-HEADERS = {
-    'accept': '*/*',
-    'accept-language': 'en-US,en;q=0.9',
-    'mode': 'no-cors',
-    'priority': 'u=1, i',
-    'referer': 'https://www.tatacliq.com/',
-    'sec-ch-ua': '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-origin',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+# =========================================================
+# Headers (same base as your working code)
+# =========================================================
+BASE_HEADERS = {
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "mode": "no-cors",
+    "priority": "u=1, i",
+    "referer": "https://www.tatacliq.com/",
+    "sec-ch-ua": '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
 }
 
-def add_cookie(headers: dict, cookie_text: str):
-    h = dict(headers)
+def build_headers(cookie_text: str):
+    """
+    Cookie is almost mandatory for TataCliq to return the product JSON payload.
+    """
+    headers = dict(BASE_HEADERS)
     if cookie_text and cookie_text.strip():
-        h["cookie"] = cookie_text.strip()
-    return h
+        headers["cookie"] = cookie_text.strip()
+    return headers
 
 
-# ================= RETRY HELPERS =================
+# =========================================================
+# Retry helper
+# =========================================================
 def safe_get(url, headers, params=None, retry_count=3, timeout=25):
     last_err = None
+
     for attempt in range(1, retry_count + 1):
         if stop_event.is_set():
             raise RuntimeError("Stopped by user")
 
         try:
             r = requests.get(url, headers=headers, params=params, timeout=timeout)
-            if r.status_code == 200:
-                return r
-            last_err = f"HTTP {r.status_code}"
+            return r
         except Exception as e:
             last_err = str(e)
 
         time.sleep(0.7 * attempt + random.random())
 
-    raise RuntimeError(f"Failed after {retry_count} attempts. Last error: {last_err}")
+    raise RuntimeError(f"Request failed after {retry_count} attempts. Last error: {last_err}")
 
 
-# ================= SIZE GUIDE HELPERS =================
+# =========================================================
+# Size Guide logic (from your working script)
+# =========================================================
 def format_size_header(raw_dim, unit=None):
     if unit:
         unit = "Inches" if unit.lower() == "in" else unit
@@ -72,7 +87,7 @@ def format_size_header(raw_dim, unit=None):
     return raw_dim
 
 
-def get_size_guide(product_id, sizeGuideId, headers):
+def get_size_guide(product_id, sizeGuideId, headers, retry_count=3):
     url = f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/{product_id}/sizeGuideChart"
     params = {
         "isPwa": "true",
@@ -80,7 +95,7 @@ def get_size_guide(product_id, sizeGuideId, headers):
         "rootCategory": "Clothing"
     }
 
-    res = safe_get(url, params=params, headers=headers)
+    res = safe_get(url, params=params, headers=headers, retry_count=retry_count)
     js = res.json()
 
     unit_data = OrderedDict()
@@ -123,39 +138,74 @@ def get_size_guide(product_id, sizeGuideId, headers):
     return final
 
 
-# ================= PRODUCT EXTRACTION =================
+# =========================================================
+# Product extraction - FINAL robust version
+# =========================================================
 def extract_product(input_value: str, headers: dict, retry_count: int):
+    """
+    Uses exact logic from your working notebook:
+    productDetails/{product_id}?isPwa=true&isMDE=true&isDynamicVar=true
+    and extracts JSON from <p>...</p>.
+    Adds debug fields if blocked.
+    """
     data = {}
-    sku = str(input_value).strip()
+    raw_input = str(input_value).strip()
 
-    if not sku:
+    if not raw_input:
         return {"Input": input_value, "Error": "Empty input"}
 
-    # supports url or sku
-    if "tatacliq.com" in sku:
-        product_id = sku.split("/p-")[-1]
+    # supports URL or SKU
+    if "tatacliq.com" in raw_input:
+        product_id = raw_input.split("/p-")[-1].strip()
     else:
-        product_id = sku
+        product_id = raw_input.strip()
 
-    api_url = f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetails/{product_id}?isPwa=true&isMDE=true&isDynamicVar=true"
-
-    try:
-        res = safe_get(api_url, headers=headers, retry_count=retry_count)
-        soup = BeautifulSoup(res.content, "html.parser")
-
-        # JSON returned inside <p> ... </p>
-        raw = str(soup)
-        if "<p>" not in raw:
-            return {"Input": input_value, "product_id": product_id, "Error": "No <p> JSON found (possible blocked request)"}
-
-        json_text = raw.split("<p>")[-1].split("</p>")[0]
-        json_data = json.loads(json_text)
-
-    except Exception as e:
-        return {"Input": input_value, "product_id": product_id, "Error": str(e)}
+    api_url = (
+        f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetails/"
+        f"{product_id}?isPwa=true&isMDE=true&isDynamicVar=true"
+    )
 
     data["Input"] = input_value
     data["product_id"] = product_id
+    data["api_url"] = api_url
+
+    try:
+        res = safe_get(api_url, headers=headers, retry_count=retry_count)
+        data["http_status"] = res.status_code
+
+        # IMPORTANT:
+        # TataCliq may return a blocked html / captcha / access denied page
+        html = res.text or ""
+
+        # No <p> => blocked or unexpected format
+        if "<p>" not in html:
+            data["blocked"] = True
+            data["Error"] = "No <p> JSON found (BLOCKED / unexpected response)"
+            data["Raw_Response_Preview"] = html[:500]
+            return data
+
+        # parse <p>json</p> safely
+        json_text = html.split("<p>")[-1].split("</p>")[0].strip()
+
+        try:
+            json_data = json.loads(json_text)
+        except Exception as e:
+            data["blocked"] = True
+            data["Error"] = f"JSON parse failed: {e}"
+            data["Raw_Response_Preview"] = json_text[:500]
+            return data
+
+    except Exception as e:
+        data["blocked"] = True
+        data["Error"] = str(e)
+        return data
+
+    # ------------------------------
+    # NORMAL EXTRACTION
+    # ------------------------------
+    data["blocked"] = False
+    data["Error"] = ""
+
     data["productTitle"] = json_data.get("productTitle")
     data["brandName"] = json_data.get("brandName")
     data["productDescription"] = json_data.get("productDescription")
@@ -167,8 +217,8 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
         data["MRP"] = json_data["mrpPrice"].get("value")
     if json_data.get("winningSellerPrice"):
         data["Price"] = json_data["winningSellerPrice"].get("value")
-    if json_data.get("discount"):
-        data["Discount"] = json_data["discount"]
+    if json_data.get("discount") is not None:
+        data["Discount"] = json_data.get("discount")
 
     # Breadcrumbs
     for i, c in enumerate(json_data.get("categoryHierarchy", [])):
@@ -186,20 +236,22 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
     for g in json_data.get("galleryImagesList", []):
         for k in g.get("galleryImages", []):
             if k.get("key") == "superZoom":
-                imgs.append("https:" + k.get("value", ""))
+                val = k.get("value", "")
+                if val:
+                    imgs.append("https:" + val)
 
     for i, im in enumerate(imgs):
         data[f"image_{i+1}"] = im
 
-    # Manufacturer
+    # Manufacturer details
     if json_data.get("mfgDetails"):
         for k, v in json_data["mfgDetails"].items():
             data[k] = v[0]["value"] if isinstance(v, list) else v
 
-    # Size Guide
+    # Size guide
     if json_data.get("sizeGuideId"):
         try:
-            size_data = get_size_guide(product_id, json_data["sizeGuideId"], headers=headers)
+            size_data = get_size_guide(product_id, json_data["sizeGuideId"], headers=headers, retry_count=retry_count)
             data.update(size_data)
         except Exception as e:
             data["SizeGuide_Error"] = str(e)
@@ -207,90 +259,134 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
     return data
 
 
-# ================= STREAMLIT UI =================
-st.title("TataCliq Product Data Extractor (Working API Version)")
+# =========================================================
+# Streamlit UI
+# =========================================================
+st.title("TataCliq Product Extractor (Notebook-Compatible)")
+st.caption("This app follows the same API + parsing logic as your working Jupyter notebook script.")
 
-uploaded_file = st.file_uploader("Upload Excel/CSV File (URL or SKU column)", type=["xlsx", "csv"])
+with st.expander("Cookie Instructions (Important)", expanded=True):
+    st.write(
+        """
+**Why Cookie is required?**
+TataCliq blocks cloud / bot-like traffic and returns a non-product HTML page.
+Your notebook works because requests include correct cookies/session.
 
-cookie_text = st.text_area(
-    "Paste Cookie (Required for TataCliq access in most cases)",
-    height=130
-)
+**How to get cookie:**
+1. Open TataCliq in Chrome
+2. Login if needed
+3. Press F12 → Network tab
+4. Reload page
+5. Click any request → Headers → copy full `cookie:` value
+6. Paste below
+"""
+    )
 
-c1, c2, c3 = st.columns(3)
+cookie_text = st.text_area("Paste cookie header here (mandatory for most cases)", height=160)
+
+uploaded_file = st.file_uploader("Upload input file (Excel/CSV)", type=["xlsx", "csv"])
+
+c1, c2, c3, c4 = st.columns(4)
 with c1:
-    max_workers = st.number_input("Threads", min_value=1, max_value=20, value=8, step=1)
+    max_workers = st.number_input("Threads", min_value=1, max_value=30, value=8, step=1)
 with c2:
     retry_count = st.number_input("Retry count", min_value=1, max_value=10, value=3, step=1)
 with c3:
-    validate_only = st.checkbox("Only validate inputs (no crawl)", value=False)
+    validate_only = st.checkbox("Only validate inputs", value=False)
+with c4:
+    show_failed_preview = st.checkbox("Show failed preview table", value=True)
 
 st.button("Stop Extraction", on_click=request_stop)
 
-if uploaded_file:
+if not uploaded_file:
+    st.info("Upload a file to start.")
+    st.stop()
+
+# read input
+try:
     if uploaded_file.name.lower().endswith(".csv"):
         df = pd.read_csv(uploaded_file)
     else:
         df = pd.read_excel(uploaded_file)
+except Exception as e:
+    st.error(f"Could not read file: {e}")
+    st.stop()
 
-    st.success(f"Loaded {len(df)} rows")
-    column = st.selectbox("Select column containing URL / SKU", df.columns)
+st.subheader("Input Preview")
+st.dataframe(df.head(20), use_container_width=True)
 
-    # Validate + dedupe
-    inputs = df[column].dropna().astype(str).tolist()
-    inputs = [i.strip() for i in inputs if i.strip()]
-    inputs = list(dict.fromkeys(inputs))  # dedupe preserve order
+col = st.selectbox("Select column containing TataCliq URL or product_id", df.columns)
 
-    st.write(f"Valid inputs after dedupe: {len(inputs)}")
+# build inputs + dedupe
+inputs = df[col].dropna().astype(str).tolist()
+inputs = [x.strip() for x in inputs if x and x.strip()]
+inputs = list(dict.fromkeys(inputs))
 
-    if validate_only:
-        st.dataframe(pd.DataFrame({"Inputs": inputs}).head(50), use_container_width=True)
-        st.stop()
+st.write(f"Rows in file: {len(df)}")
+st.write(f"Valid inputs after dedupe: {len(inputs)}")
 
-    if st.button("Start Extraction", type="primary"):
-        stop_event.clear()
-        headers = add_cookie(HEADERS, cookie_text)
+if validate_only:
+    st.success("Validation completed.")
+    st.dataframe(pd.DataFrame({"Input": inputs}).head(100), use_container_width=True)
+    st.stop()
 
-        results = []
-        progress = st.progress(0.0)
-        status = st.empty()
+if st.button("Start Extraction", type="primary"):
+    if not cookie_text.strip():
+        st.warning("Cookie is empty. TataCliq will likely block requests and extraction may fail.")
 
-        with st.spinner("Extracting data..."):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_workers)) as exe:
-                futures = {exe.submit(extract_product, inp, headers, int(retry_count)): inp for inp in inputs}
+    stop_event.clear()
+    headers = build_headers(cookie_text)
 
-                done = 0
-                for fut in concurrent.futures.as_completed(futures):
-                    if stop_event.is_set():
-                        break
-                    res = fut.result()
-                    results.append(res)
+    results = []
+    progress = st.progress(0.0)
+    status = st.empty()
 
-                    done += 1
-                    progress.progress(done / len(inputs))
-                    status.write(f"Completed {done}/{len(inputs)}")
+    with st.spinner("Extracting data..."):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_workers)) as exe:
+            futures = {exe.submit(extract_product, inp, headers, int(retry_count)): inp for inp in inputs}
 
-        out_df = pd.DataFrame(results)
-        st.success("Extraction completed!")
+            done = 0
+            for fut in concurrent.futures.as_completed(futures):
+                if stop_event.is_set():
+                    break
 
-        st.dataframe(out_df.head(20), use_container_width=True)
+                res = fut.result()
+                results.append(res)
 
-        # Save to Excel in memory
-        out_xlsx = io.BytesIO()
-        with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
-            out_df.to_excel(writer, index=False, sheet_name="Output")
-        out_xlsx.seek(0)
+                done += 1
+                progress.progress(done / len(inputs))
+                status.write(f"Completed {done}/{len(inputs)}")
 
-        st.download_button(
-            label="Download Output Excel",
-            data=out_xlsx.getvalue(),
-            file_name="tatacliq_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    out_df = pd.DataFrame(results)
 
-        st.download_button(
-            label="Download Output CSV",
-            data=out_df.to_csv(index=False).encode("utf-8"),
-            file_name="tatacliq_output.csv",
-            mime="text/csv"
-        )
+    st.success("Extraction completed!")
+    st.subheader("Output Preview")
+    st.dataframe(out_df.head(50), use_container_width=True)
+
+    # Optional: show failures
+    if show_failed_preview:
+        failed = out_df[out_df.get("blocked", False) == True]
+        if len(failed) > 0:
+            st.warning(f"Blocked / Failed rows: {len(failed)}")
+            st.dataframe(failed[["Input", "product_id", "http_status", "Error", "Raw_Response_Preview"]].head(50),
+                         use_container_width=True)
+
+    # Downloads
+    out_xlsx = io.BytesIO()
+    with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
+        out_df.to_excel(writer, index=False, sheet_name="Output")
+    out_xlsx.seek(0)
+
+    st.download_button(
+        label="Download Output Excel",
+        data=out_xlsx.getvalue(),
+        file_name="tatacliq_output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    st.download_button(
+        label="Download Output CSV",
+        data=out_df.to_csv(index=False).encode("utf-8"),
+        file_name="tatacliq_output.csv",
+        mime="text/csv"
+    )
