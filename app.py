@@ -1,7 +1,6 @@
 import json
 import time
 import random
-import re
 import io
 import threading
 import concurrent.futures
@@ -48,7 +47,8 @@ BASE_HEADERS = {
 
 def build_headers(cookie_text: str):
     """
-    Cookie is almost mandatory for TataCliq to return the product JSON payload.
+    Cookie is often required for TataCliq.
+    But even without cookie, TataCliq may return raw JSON (mobile payload) sometimes.
     """
     headers = dict(BASE_HEADERS)
     if cookie_text and cookie_text.strip():
@@ -143,10 +143,12 @@ def get_size_guide(product_id, sizeGuideId, headers, retry_count=3):
 # =========================================================
 def extract_product(input_value: str, headers: dict, retry_count: int):
     """
-    Uses exact logic from your working notebook:
-    productDetails/{product_id}?isPwa=true&isMDE=true&isDynamicVar=true
-    and extracts JSON from <p>...</p>.
-    Adds debug fields if blocked.
+    Uses the SAME TataCliq API as your notebook:
+    /productDetails/{product_id}?isPwa=true&isMDE=true&isDynamicVar=true
+
+    But handles both response formats:
+    1) <p>{json}</p> (HTML wrapper)
+    2) raw JSON string: { ... }
     """
     data = {}
     raw_input = str(input_value).strip()
@@ -173,26 +175,41 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
         res = safe_get(api_url, headers=headers, retry_count=retry_count)
         data["http_status"] = res.status_code
 
-        # IMPORTANT:
-        # TataCliq may return a blocked html / captcha / access denied page
-        html = res.text or ""
+        body = res.text or ""
+        body_stripped = body.strip()
 
-        # No <p> => blocked or unexpected format
-        if "<p>" not in html:
+        # ----------------------------
+        # FORMAT A: Raw JSON directly
+        # ----------------------------
+        if body_stripped.startswith("{") and body_stripped.endswith("}"):
+            try:
+                json_data = json.loads(body_stripped)
+            except Exception as e:
+                data["blocked"] = True
+                data["Error"] = f"Raw JSON parse failed: {e}"
+                data["Raw_Response_Preview"] = body_stripped[:500]
+                return data
+
+        # ----------------------------
+        # FORMAT B: HTML with <p>{json}</p>
+        # ----------------------------
+        elif "<p>" in body:
+            json_text = body.split("<p>")[-1].split("</p>")[0].strip()
+            try:
+                json_data = json.loads(json_text)
+            except Exception as e:
+                data["blocked"] = True
+                data["Error"] = f"<p> JSON parse failed: {e}"
+                data["Raw_Response_Preview"] = json_text[:500]
+                return data
+
+        # ----------------------------
+        # UNKNOWN FORMAT (blocked/captcha/etc.)
+        # ----------------------------
+        else:
             data["blocked"] = True
-            data["Error"] = "No <p> JSON found (BLOCKED / unexpected response)"
-            data["Raw_Response_Preview"] = html[:500]
-            return data
-
-        # parse <p>json</p> safely
-        json_text = html.split("<p>")[-1].split("</p>")[0].strip()
-
-        try:
-            json_data = json.loads(json_text)
-        except Exception as e:
-            data["blocked"] = True
-            data["Error"] = f"JSON parse failed: {e}"
-            data["Raw_Response_Preview"] = json_text[:500]
+            data["Error"] = "Unexpected response format (not raw JSON, not <p> JSON)"
+            data["Raw_Response_Preview"] = body_stripped[:500]
             return data
 
     except Exception as e:
@@ -263,26 +280,24 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
 # Streamlit UI
 # =========================================================
 st.title("TataCliq Product Extractor (Notebook-Compatible)")
-st.caption("This app follows the same API + parsing logic as your working Jupyter notebook script.")
+st.caption("Uses your same API endpoint + logic, but supports both HTML <p> JSON and Raw JSON responses.")
 
 with st.expander("Cookie Instructions (Important)", expanded=True):
     st.write(
         """
-**Why Cookie is required?**
-TataCliq blocks cloud / bot-like traffic and returns a non-product HTML page.
-Your notebook works because requests include correct cookies/session.
+**Why Cookie is useful?**
+TataCliq sometimes blocks cloud/bot traffic. Cookie improves success rate.
 
 **How to get cookie:**
 1. Open TataCliq in Chrome
-2. Login if needed
-3. Press F12 → Network tab
-4. Reload page
-5. Click any request → Headers → copy full `cookie:` value
-6. Paste below
+2. Press F12 → Network tab
+3. Reload
+4. Click a request → Headers → copy full `cookie:` value
+5. Paste below
 """
     )
 
-cookie_text = st.text_area("Paste cookie header here (mandatory for most cases)", height=160)
+cookie_text = st.text_area("Paste cookie header here (optional but recommended)", height=160)
 
 uploaded_file = st.file_uploader("Upload input file (Excel/CSV)", type=["xlsx", "csv"])
 
@@ -331,9 +346,6 @@ if validate_only:
     st.stop()
 
 if st.button("Start Extraction", type="primary"):
-    if not cookie_text.strip():
-        st.warning("Cookie is empty. TataCliq will likely block requests and extraction may fail.")
-
     stop_event.clear()
     headers = build_headers(cookie_text)
 
@@ -363,13 +375,13 @@ if st.button("Start Extraction", type="primary"):
     st.subheader("Output Preview")
     st.dataframe(out_df.head(50), use_container_width=True)
 
-    # Optional: show failures
+    # show failures
     if show_failed_preview:
         failed = out_df[out_df.get("blocked", False) == True]
         if len(failed) > 0:
-            st.warning(f"Blocked / Failed rows: {len(failed)}")
-            st.dataframe(failed[["Input", "product_id", "http_status", "Error", "Raw_Response_Preview"]].head(50),
-                         use_container_width=True)
+            st.warning(f"Failed/Unexpected format rows: {len(failed)}")
+            keep_cols = [c for c in ["Input", "product_id", "http_status", "Error", "Raw_Response_Preview"] if c in failed.columns]
+            st.dataframe(failed[keep_cols].head(50), use_container_width=True)
 
     # Downloads
     out_xlsx = io.BytesIO()
