@@ -10,6 +10,9 @@ from urllib.parse import urlparse
 
 st.set_page_config(page_title="TataCliq Crawler", layout="wide")
 
+# ✅ ALWAYS initialize session_state keys at the top
+st.session_state.setdefault("stop_requested", False)
+
 # -----------------------------
 # Config / constants
 # -----------------------------
@@ -28,13 +31,10 @@ BASE_HEADERS = {
 }
 
 # -----------------------------
-# Session stop flag
+# Stop control
 # -----------------------------
-if "stop_requested" not in st.session_state:
-    st.session_state.stop_requested = False
-
 def request_stop():
-    st.session_state.stop_requested = True
+    st.session_state["stop_requested"] = True
 
 # -----------------------------
 # Networking helpers
@@ -48,7 +48,7 @@ def make_headers(cookie_text: str | None):
 def safe_get_json(url, headers, retry_count=3, timeout=25):
     last_err = None
     for attempt in range(1, retry_count + 1):
-        if st.session_state.stop_requested:
+        if st.session_state["stop_requested"]:
             raise RuntimeError("Stopped by user")
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
@@ -63,7 +63,7 @@ def safe_get_json(url, headers, retry_count=3, timeout=25):
 def safe_get_text(url, headers, retry_count=3, timeout=25):
     last_err = None
     for attempt in range(1, retry_count + 1):
-        if st.session_state.stop_requested:
+        if st.session_state["stop_requested"]:
             raise RuntimeError("Stopped by user")
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
@@ -82,7 +82,6 @@ def normalize_url(u: str) -> str:
     u = str(u).strip()
     if not u:
         return ""
-    # allow missing scheme
     if u.startswith("www."):
         u = "https://" + u
     return u
@@ -102,9 +101,8 @@ def is_valid_tatacliq_url(u: str) -> bool:
 # Parsing
 # -----------------------------
 def extract_product_id(url: str):
-    # Robust extraction: any 6+ digit sequence
     import re
-    m = re.search(r'(\d{6,})', str(url))
+    m = re.search(r"(\d{6,})", str(url))
     return m.group(1) if m else None
 
 def get_details_data(product_id, headers, retry_count):
@@ -184,7 +182,7 @@ def crawl_single(url, headers, retry_count):
 # Crawl runner (multithread)
 # -----------------------------
 def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
-    st.session_state.stop_requested = False
+    st.session_state["stop_requested"] = False
 
     results = []
     errors = 0
@@ -197,9 +195,8 @@ def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
     lock = threading.Lock()
 
     def task(u):
-        if st.session_state.stop_requested:
+        if st.session_state["stop_requested"]:
             return {"URL": u, "Error": "Stopped by user"}
-        # small jitter to avoid burst
         time.sleep(random.uniform(sleep_min, sleep_max))
         return crawl_single(u, headers, retry_count)
 
@@ -208,8 +205,7 @@ def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
 
         for fut in as_completed(futures):
             u = futures[fut]
-            if st.session_state.stop_requested:
-                # don't wait for remaining; they will complete but we stop collecting
+            if st.session_state["stop_requested"]:
                 break
             try:
                 res = fut.result()
@@ -224,7 +220,7 @@ def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
                 progress.progress(min(completed / total, 1.0))
                 status.write(f"Completed {completed}/{total} | Errors: {errors}")
 
-    if st.session_state.stop_requested:
+    if st.session_state["stop_requested"]:
         status.warning(f"Stopped by user. Completed {len(results)}/{total}.")
     else:
         status.success(f"Done. Total: {total} | Errors: {errors}")
@@ -258,7 +254,6 @@ with st.expander("Upload & settings", expanded=True):
     st.button("Stop Crawl", on_click=request_stop, type="secondary")
 
 if file:
-    # Load
     try:
         if file.name.lower().endswith(".csv"):
             df = pd.read_csv(file)
@@ -279,7 +274,6 @@ if file:
             break
     url_col = st.selectbox("Select the column containing product URLs", cols, index=cols.index(default_col) if default_col in cols else 0)
 
-    # Validate + dedupe
     raw_urls = df[url_col].fillna("").astype(str).tolist()
     normalized = [normalize_url(u) for u in raw_urls if str(u).strip()]
 
@@ -291,17 +285,16 @@ if file:
         if not is_valid_tatacliq_url(u):
             invalid_urls.append(u)
             continue
-        key = u.strip()
-        if key in seen:
+        if u in seen:
             continue
-        seen.add(key)
-        valid_urls.append(key)
+        seen.add(u)
+        valid_urls.append(u)
 
     st.markdown("### URL Validation Summary")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Input rows", len(raw_urls))
-    c2.metric("Valid URLs", len(valid_urls))
-    c3.metric("Invalid/Skipped", len(invalid_urls))
+    a, b, c = st.columns(3)
+    a.metric("Input rows", len(raw_urls))
+    b.metric("Valid URLs", len(valid_urls))
+    c.metric("Invalid/Skipped", len(invalid_urls))
 
     if invalid_urls:
         with st.expander("View invalid URLs"):
@@ -331,8 +324,6 @@ if file:
         st.subheader("Extracted output")
         st.dataframe(out_df, use_container_width=True)
 
-        # Downloads
-        import io
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
             out_df.to_excel(writer, index=False, sheet_name="Extracted")
@@ -350,6 +341,5 @@ if file:
             file_name="tatacliq_extracted.csv",
             mime="text/csv",
         )
-
 else:
     st.info("Upload a file to begin. Your sheet must contain a column with product URLs.")
