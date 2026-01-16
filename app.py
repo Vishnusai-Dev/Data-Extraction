@@ -6,10 +6,11 @@ import time
 import random
 import threading
 import io
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
 import re
 import json
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 st.set_page_config(page_title="TataCliq Crawler", layout="wide")
 
@@ -79,23 +80,14 @@ def safe_get(url, headers, retry_count=3, timeout=25):
         time.sleep(0.6 * attempt + random.random())
     raise RuntimeError(f"GET failed after {retry_count} attempts: {last_err}")
 
-def safe_post(url, headers, payload, retry_count=3, timeout=25):
-    last_err = None
-    for attempt in range(1, retry_count + 1):
-        if stop_event.is_set():
-            raise RuntimeError("Stopped by user")
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            return r
-        except Exception as e:
-            last_err = str(e)
-        time.sleep(0.6 * attempt + random.random())
-    raise RuntimeError(f"POST failed after {retry_count} attempts: {last_err}")
-
 # -----------------------------
 # Extraction helpers
 # -----------------------------
 def extract_mp_code(url: str):
+    """
+    Extract TataCliq SKU from URL.
+    Example: .../p-MP000000029530017 -> MP000000029530017
+    """
     m = re.search(r"p-(MP\d+)", str(url), re.IGNORECASE)
     if m:
         return m.group(1).upper()
@@ -104,55 +96,47 @@ def extract_mp_code(url: str):
         return m.group(1).upper()
     return None
 
-def flatten_list(x):
-    if x is None:
-        return ""
-    if isinstance(x, list):
-        return ", ".join([str(i) for i in x])
-    return str(x)
-
-# -----------------------------
-# API attempts
-# -----------------------------
-def try_sku_api_variants(mp_code, headers, retry_count):
-    """
-    Try multiple TataCliq API endpoint/payload styles.
-    Return product dict if found, else None.
-    """
-    endpoints = [
-        ("https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetailsBySKUs", {"skuIds": [mp_code]}),
-        ("https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetailsBySKUs", {"skuId": mp_code}),
-        ("https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetailsBySku", {"skuId": mp_code}),
-    ]
-
-    for ep, payload in endpoints:
-        r = safe_post(ep, headers=headers, payload=payload, retry_count=retry_count)
-        if r.status_code != 200:
-            continue
-
+def safe_json_dumps(obj):
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
         try:
-            data = r.json()
+            return json.dumps(str(obj), ensure_ascii=False)
         except Exception:
-            continue
+            return ""
 
-        # common structures
-        if isinstance(data, dict):
-            if "products" in data and isinstance(data["products"], list) and data["products"]:
-                return data["products"][0]
-            if "productDetails" in data and isinstance(data["productDetails"], list) and data["productDetails"]:
-                return data["productDetails"][0]
-            if "product" in data and isinstance(data["product"], dict):
-                return data["product"]
+def extract_basic_meta(soup: BeautifulSoup):
+    out = {}
 
-    return None
+    # Title
+    if soup.title:
+        out["Meta_Title"] = soup.title.get_text(strip=True)
+
+    # OG tags
+    def meta(prop):
+        t = soup.find("meta", {"property": prop})
+        return t.get("content") if t and t.get("content") else ""
+
+    out["Meta_OG_Title"] = meta("og:title")
+    out["Meta_OG_Description"] = meta("og:description")
+    out["Meta_OG_Image"] = meta("og:image")
+
+    # canonical
+    canon = soup.find("link", {"rel": "canonical"})
+    if canon and canon.get("href"):
+        out["Canonical"] = canon["href"]
+
+    return out
 
 # -----------------------------
-# HTML fallback extraction
+# Full PDP JSON extraction (main requirement)
 # -----------------------------
-def extract_from_html(url, headers, retry_count):
+def extract_pdp_json_from_html(url, headers, retry_count):
     """
-    If API fails, scrape minimal info from HTML.
-    This avoids total failure due to API 404/blocks.
+    Extract embedded PDP JSON from:
+    1) __NEXT_DATA__
+    2) window.__PRELOADED_STATE__ / __APOLLO_STATE__
+    3) JSON-LD (fallback)
     """
     r = safe_get(url, headers=headers, retry_count=retry_count)
     if r.status_code != 200:
@@ -161,44 +145,54 @@ def extract_from_html(url, headers, retry_count):
     html = r.text
     soup = BeautifulSoup(html, "html.parser")
 
-    out = {}
+    out = extract_basic_meta(soup)
 
-    # Title
-    if soup.title:
-        out["Product Name"] = soup.title.get_text(strip=True)
+    # 1) __NEXT_DATA__
+    next_data = soup.find("script", {"id": "__NEXT_DATA__"})
+    if next_data and next_data.string:
+        try:
+            jd = json.loads(next_data.string)
+            out["PDP_Source"] = "__NEXT_DATA__"
+            out["PDP_JSON"] = safe_json_dumps(jd)
+            return out
+        except Exception:
+            pass
 
-    # Meta tags
-    og_title = soup.find("meta", {"property": "og:title"})
-    if og_title and og_title.get("content"):
-        out["Product Name"] = og_title["content"]
+    # 2) Preloaded state patterns in scripts
+    for s in soup.find_all("script"):
+        if not s.string:
+            continue
+        txt = s.string.strip()
 
-    og_desc = soup.find("meta", {"property": "og:description"})
-    if og_desc and og_desc.get("content"):
-        out["Description"] = og_desc["content"]
+        if "__PRELOADED_STATE__" in txt or "__APOLLO_STATE__" in txt:
+            # attempt JSON object extraction
+            m = re.search(r"=\s*({.*})\s*;?\s*$", txt, re.DOTALL)
+            if m:
+                try:
+                    jd = json.loads(m.group(1))
+                    out["PDP_Source"] = "PRELOADED_STATE/APOLLO"
+                    out["PDP_JSON"] = safe_json_dumps(jd)
+                    return out
+                except Exception:
+                    pass
 
-    og_image = soup.find("meta", {"property": "og:image"})
-    if og_image and og_image.get("content"):
-        out["Image"] = og_image["content"]
-
-    # JSON-LD (often contains brand/price)
+    # 3) JSON-LD fallback
     scripts = soup.find_all("script", {"type": "application/ld+json"})
     for s in scripts:
+        if not s.string:
+            continue
         try:
             jd = json.loads(s.string)
-            if isinstance(jd, dict):
-                if "brand" in jd:
-                    if isinstance(jd["brand"], dict):
-                        out["Brand"] = jd["brand"].get("name", "")
-                    else:
-                        out["Brand"] = str(jd["brand"])
-                if "name" in jd and not out.get("Product Name"):
-                    out["Product Name"] = jd["name"]
-                if "offers" in jd and isinstance(jd["offers"], dict):
-                    out["Selling Price"] = jd["offers"].get("price", "")
-                    out["Currency"] = jd["offers"].get("priceCurrency", "")
+            if isinstance(jd, dict) or isinstance(jd, list):
+                out["PDP_Source"] = "JSON-LD"
+                out["PDP_JSON"] = safe_json_dumps(jd)
+                return out
         except Exception:
             continue
 
+    out["PDP_Source"] = "NOT_FOUND"
+    out["PDP_JSON"] = ""
+    out["Error"] = "No embedded PDP JSON found in HTML"
     return out
 
 # -----------------------------
@@ -209,43 +203,25 @@ def crawl_single(url, headers, retry_count):
         return {"URL": url, "Error": "Stopped by user"}
 
     out = {"URL": url}
+    sku = extract_mp_code(url)
+    out["SKU"] = sku or ""
 
-    mp_code = extract_mp_code(url)
-    out["SKU Code"] = mp_code or ""
-
-    # Try API first
-    product = None
-    if mp_code:
-        try:
-            product = try_sku_api_variants(mp_code, headers, retry_count)
-        except Exception as e:
-            out["API Error"] = str(e)
-
-    if product:
-        out["Brand"] = product.get("brand", "")
-        out["Product Name"] = product.get("productName", "") or product.get("name", "")
-        out["MRP"] = product.get("mrp", "")
-        out["Selling Price"] = product.get("offerPrice", "") or product.get("sellingPrice", "")
-        out["Category"] = flatten_list(product.get("category", ""))
-        out["Sub Category"] = flatten_list(product.get("subCategory", ""))
-        out["In Stock"] = product.get("inStock", "")
-        return out
-
-    # Fallback: HTML extraction
     try:
-        html_data = extract_from_html(url, headers, retry_count)
-        out.update(html_data)
-        if "Error" in html_data:
-            out["Error"] = html_data["Error"]
+        pdp = extract_pdp_json_from_html(url, headers, retry_count)
+        out.update(pdp)
+
+        # If we got PDP_JSON, mark success
+        if out.get("PDP_JSON"):
+            out["Error"] = ""
         else:
-            out["Error"] = ""  # no error, just fallback
+            out["Error"] = out.get("Error", "No PDP JSON")
     except Exception as e:
         out["Error"] = str(e)
 
     return out
 
 # -----------------------------
-# Crawl runner (multithread)
+# Crawl runner (multi-thread)
 # -----------------------------
 def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
     stop_event.clear()
@@ -295,10 +271,39 @@ def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
     return pd.DataFrame(results)
 
 # -----------------------------
+# ZIP builder for PDP JSON files
+# -----------------------------
+def build_pdp_zip(df: pd.DataFrame):
+    """
+    Creates a zip in-memory:
+    - output_summary.csv
+    - pdp_json/<sku_or_row>.json (only when PDP_JSON exists)
+    """
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        # summary CSV
+        z.writestr("output_summary.csv", df.to_csv(index=False))
+
+        # json files
+        for i, row in df.iterrows():
+            pdp_json = row.get("PDP_JSON", "")
+            if not isinstance(pdp_json, str) or not pdp_json.strip():
+                continue
+
+            sku = row.get("SKU", "")
+            name = sku if sku else f"row_{i+1}"
+            name = re.sub(r"[^A-Za-z0-9_\-]", "_", str(name))
+
+            z.writestr(f"pdp_json/{name}.json", pdp_json)
+
+    mem_zip.seek(0)
+    return mem_zip.getvalue()
+
+# -----------------------------
 # UI
 # -----------------------------
-st.title("TataCliq Product Crawler")
-st.caption("Upload URLs (Excel/CSV) → validate/dedupe → crawl → download extracted data")
+st.title("TataCliq PDP Crawler")
+st.caption("Uploads → validates → downloads FULL PDP embedded JSON")
 
 with st.expander("Upload & settings", expanded=True):
     file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
@@ -324,7 +329,7 @@ if not file:
     st.info("Upload a file to begin.")
     st.stop()
 
-# Load file
+# load
 try:
     if file.name.lower().endswith(".csv"):
         df = pd.read_csv(file)
@@ -365,7 +370,7 @@ if invalid_urls:
         st.write(pd.DataFrame({"Invalid URL": invalid_urls}))
 
 if not valid_urls:
-    st.error("No valid URLs found.")
+    st.error("No valid TataCliq URLs found.")
     st.stop()
 
 if validate_only:
@@ -388,21 +393,32 @@ if st.button("Start Crawl", type="primary"):
     st.subheader("Extracted output")
     st.dataframe(out_df, use_container_width=True)
 
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        out_df.to_excel(writer, index=False, sheet_name="Extracted")
+    # Excel summary
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
+        out_df.drop(columns=["PDP_JSON"], errors="ignore").to_excel(writer, index=False, sheet_name="Summary")
+    excel_buffer.seek(0)
 
     st.download_button(
-        label="Download Extracted Data (Excel)",
-        data=buffer.getvalue(),
-        file_name="tatacliq_extracted.xlsx",
+        label="Download Summary Excel (without PDP_JSON column)",
+        data=excel_buffer.getvalue(),
+        file_name="tatacliq_summary.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+    # CSV full
     st.download_button(
-        label="Download Extracted Data (CSV)",
+        label="Download Full CSV (includes PDP_JSON)",
         data=out_df.to_csv(index=False).encode("utf-8"),
-        file_name="tatacliq_extracted.csv",
+        file_name="tatacliq_output.csv",
         mime="text/csv",
     )
 
+    # ZIP with individual JSONs
+    zip_bytes = build_pdp_zip(out_df)
+    st.download_button(
+        label="Download PDP JSON ZIP (Recommended)",
+        data=zip_bytes,
+        file_name="tatacliq_pdp_json.zip",
+        mime="application/zip",
+    )
