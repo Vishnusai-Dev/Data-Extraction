@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 import time
 import random
 import threading
+import io   # ✅ ADD THIS
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
