@@ -9,6 +9,7 @@ import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 import re
+import json
 
 st.set_page_config(page_title="TataCliq Crawler", layout="wide")
 
@@ -21,7 +22,7 @@ def request_stop():
     stop_event.set()
 
 # -----------------------------
-# Config / constants
+# Config
 # -----------------------------
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
@@ -30,16 +31,10 @@ BASE_HEADERS = {
     "accept-language": "en-US,en;q=0.9",
     "content-type": "application/json",
     "user-agent": DEFAULT_UA,
-    "sec-ch-ua": '"Not.A/Brand";v="8", "Chromium";v="125", "Google Chrome";v="125"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
     "origin": "https://www.tatacliq.com",
     "referer": "https://www.tatacliq.com/",
 }
 
-# -----------------------------
-# Headers helper
-# -----------------------------
 def make_headers(cookie_text: str | None):
     headers = dict(BASE_HEADERS)
     if cookie_text and cookie_text.strip():
@@ -47,7 +42,7 @@ def make_headers(cookie_text: str | None):
     return headers
 
 # -----------------------------
-# URL Validation / Normalization
+# URL Validation
 # -----------------------------
 def normalize_url(u: str) -> str:
     u = str(u).strip()
@@ -69,62 +64,44 @@ def is_valid_tatacliq_url(u: str) -> bool:
         return False
 
 # -----------------------------
-# Networking helpers
+# Network helpers
 # -----------------------------
-def safe_get_text(url, headers, retry_count=3, timeout=25):
+def safe_get(url, headers, retry_count=3, timeout=25):
     last_err = None
     for attempt in range(1, retry_count + 1):
         if stop_event.is_set():
             raise RuntimeError("Stopped by user")
-
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
-            if r.status_code == 200:
-                return r.text
-            last_err = f"HTTP {r.status_code}"
+            return r
         except Exception as e:
             last_err = str(e)
-
         time.sleep(0.6 * attempt + random.random())
+    raise RuntimeError(f"GET failed after {retry_count} attempts: {last_err}")
 
-    raise RuntimeError(f"Failed after {retry_count} attempts. Last error: {last_err}")
-
-def safe_post_json(url, headers, payload, retry_count=3, timeout=25):
+def safe_post(url, headers, payload, retry_count=3, timeout=25):
     last_err = None
     for attempt in range(1, retry_count + 1):
         if stop_event.is_set():
             raise RuntimeError("Stopped by user")
-
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
-            last_err = f"HTTP {r.status_code}"
+            return r
         except Exception as e:
             last_err = str(e)
-
         time.sleep(0.6 * attempt + random.random())
-
-    raise RuntimeError(f"Failed after {retry_count} attempts. Last error: {last_err}")
+    raise RuntimeError(f"POST failed after {retry_count} attempts: {last_err}")
 
 # -----------------------------
-# TataCliq specific extraction
+# Extraction helpers
 # -----------------------------
-def extract_tatacliq_code(url: str):
-    """
-    Extract TataCliq SKU code from URL.
-    Example: p-MP000000029530017 -> MP000000029530017
-    """
-    url = str(url).strip()
-
-    m = re.search(r"p-(MP\d+)", url, re.IGNORECASE)
+def extract_mp_code(url: str):
+    m = re.search(r"p-(MP\d+)", str(url), re.IGNORECASE)
     if m:
         return m.group(1).upper()
-
-    m = re.search(r"(MP\d+)", url, re.IGNORECASE)
+    m = re.search(r"(MP\d+)", str(url), re.IGNORECASE)
     if m:
         return m.group(1).upper()
-
     return None
 
 def flatten_list(x):
@@ -135,52 +112,114 @@ def flatten_list(x):
     return str(x)
 
 # -----------------------------
-# TataCliq API - SKU based (works for p-MP URLs)
+# API attempts
 # -----------------------------
-def get_details_by_sku(mp_code, headers, retry_count):
-    url = "https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetailsBySKUs"
-    payload = {"skuIds": [mp_code]}
-    return safe_post_json(url, headers=headers, payload=payload, retry_count=retry_count)
+def try_sku_api_variants(mp_code, headers, retry_count):
+    """
+    Try multiple TataCliq API endpoint/payload styles.
+    Return product dict if found, else None.
+    """
+    endpoints = [
+        ("https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetailsBySKUs", {"skuIds": [mp_code]}),
+        ("https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetailsBySKUs", {"skuId": mp_code}),
+        ("https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetailsBySku", {"skuId": mp_code}),
+    ]
+
+    for ep, payload in endpoints:
+        r = safe_post(ep, headers=headers, payload=payload, retry_count=retry_count)
+        if r.status_code != 200:
+            continue
+
+        try:
+            data = r.json()
+        except Exception:
+            continue
+
+        # common structures
+        if isinstance(data, dict):
+            if "products" in data and isinstance(data["products"], list) and data["products"]:
+                return data["products"][0]
+            if "productDetails" in data and isinstance(data["productDetails"], list) and data["productDetails"]:
+                return data["productDetails"][0]
+            if "product" in data and isinstance(data["product"], dict):
+                return data["product"]
+
+    return None
 
 # -----------------------------
-# Optional Size Guide extraction (HTML-based)
+# HTML fallback extraction
 # -----------------------------
-def get_size_guide(product_url, headers, retry_count):
-    html = safe_get_text(product_url, headers=headers, retry_count=retry_count)
+def extract_from_html(url, headers, retry_count):
+    """
+    If API fails, scrape minimal info from HTML.
+    This avoids total failure due to API 404/blocks.
+    """
+    r = safe_get(url, headers=headers, retry_count=retry_count)
+    if r.status_code != 200:
+        return {"Error": f"HTML fetch failed HTTP {r.status_code}"}
+
+    html = r.text
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True).lower()
-    if "size guide" not in text:
-        return None
-    return "Size guide available on page"
+
+    out = {}
+
+    # Title
+    if soup.title:
+        out["Product Name"] = soup.title.get_text(strip=True)
+
+    # Meta tags
+    og_title = soup.find("meta", {"property": "og:title"})
+    if og_title and og_title.get("content"):
+        out["Product Name"] = og_title["content"]
+
+    og_desc = soup.find("meta", {"property": "og:description"})
+    if og_desc and og_desc.get("content"):
+        out["Description"] = og_desc["content"]
+
+    og_image = soup.find("meta", {"property": "og:image"})
+    if og_image and og_image.get("content"):
+        out["Image"] = og_image["content"]
+
+    # JSON-LD (often contains brand/price)
+    scripts = soup.find_all("script", {"type": "application/ld+json"})
+    for s in scripts:
+        try:
+            jd = json.loads(s.string)
+            if isinstance(jd, dict):
+                if "brand" in jd:
+                    if isinstance(jd["brand"], dict):
+                        out["Brand"] = jd["brand"].get("name", "")
+                    else:
+                        out["Brand"] = str(jd["brand"])
+                if "name" in jd and not out.get("Product Name"):
+                    out["Product Name"] = jd["name"]
+                if "offers" in jd and isinstance(jd["offers"], dict):
+                    out["Selling Price"] = jd["offers"].get("price", "")
+                    out["Currency"] = jd["offers"].get("priceCurrency", "")
+        except Exception:
+            continue
+
+    return out
 
 # -----------------------------
-# Crawl single URL
+# Crawl one URL
 # -----------------------------
 def crawl_single(url, headers, retry_count):
     if stop_event.is_set():
         return {"URL": url, "Error": "Stopped by user"}
 
-    mp_code = extract_tatacliq_code(url)
-    if not mp_code:
-        return {"URL": url, "Error": "Could not extract MP code (SKU) from URL"}
+    out = {"URL": url}
 
-    try:
-        details = get_details_by_sku(mp_code, headers, retry_count)
-    except Exception as e:
-        return {"URL": url, "SKU Code": mp_code, "Error": str(e)}
+    mp_code = extract_mp_code(url)
+    out["SKU Code"] = mp_code or ""
 
-    out = {"URL": url, "SKU Code": mp_code}
-
-    # Extract product block
+    # Try API first
     product = None
-    try:
-        if isinstance(details, dict):
-            if "products" in details and isinstance(details["products"], list) and len(details["products"]) > 0:
-                product = details["products"][0]
-            elif "productDetails" in details and isinstance(details["productDetails"], list) and len(details["productDetails"]) > 0:
-                product = details["productDetails"][0]
-    except Exception:
-        product = None
+    if mp_code:
+        try:
+            product = try_sku_api_variants(mp_code, headers, retry_count)
+        except Exception as e:
+            out["API Error"] = str(e)
 
     if product:
         out["Brand"] = product.get("brand", "")
@@ -190,12 +229,18 @@ def crawl_single(url, headers, retry_count):
         out["Category"] = flatten_list(product.get("category", ""))
         out["Sub Category"] = flatten_list(product.get("subCategory", ""))
         out["In Stock"] = product.get("inStock", "")
+        return out
 
-    # HTML size guide check
+    # Fallback: HTML extraction
     try:
-        out["Size Guide"] = get_size_guide(url, headers, retry_count)
-    except Exception:
-        out["Size Guide"] = None
+        html_data = extract_from_html(url, headers, retry_count)
+        out.update(html_data)
+        if "Error" in html_data:
+            out["Error"] = html_data["Error"]
+        else:
+            out["Error"] = ""  # no error, just fallback
+    except Exception as e:
+        out["Error"] = str(e)
 
     return out
 
@@ -206,11 +251,11 @@ def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
     stop_event.clear()
 
     results = []
-    errors = 0
     total = len(urls)
     completed = 0
-    lock = threading.Lock()
+    errors = 0
 
+    lock = threading.Lock()
     progress = st.progress(0.0)
     status = st.empty()
 
@@ -225,7 +270,6 @@ def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
 
         for fut in as_completed(futures):
             u = futures[fut]
-
             if stop_event.is_set():
                 break
 
@@ -251,36 +295,33 @@ def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
     return pd.DataFrame(results)
 
 # -----------------------------
-# Streamlit UI
+# UI
 # -----------------------------
 st.title("TataCliq Product Crawler")
-st.caption("Upload URLs (Excel/CSV) → validate/dedupe → multithread crawl → download extracted data")
+st.caption("Upload URLs (Excel/CSV) → validate/dedupe → crawl → download extracted data")
 
 with st.expander("Upload & settings", expanded=True):
     file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
-    cookie_text = st.text_area(
-        "Optional: Cookie header (if TataCliq blocks requests). Leave empty for public use.",
-        height=110
-    )
+    cookie_text = st.text_area("Optional Cookie header (if TataCliq blocks)", height=100)
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        retry_count = st.number_input("Retry count (per request)", min_value=1, max_value=10, value=3, step=1)
+        retry_count = st.number_input("Retry count", min_value=1, max_value=10, value=3, step=1)
     with c2:
-        max_workers = st.number_input("Threads (parallel URLs)", min_value=1, max_value=20, value=6, step=1)
+        max_workers = st.number_input("Threads", min_value=1, max_value=20, value=6, step=1)
     with c3:
-        validate_only = st.checkbox("Only validate + dedupe (no crawl)", value=False)
+        validate_only = st.checkbox("Only validate + dedupe", value=False)
 
     c4, c5 = st.columns(2)
     with c4:
-        sleep_min = st.number_input("Min jitter per URL (sec)", min_value=0.0, max_value=10.0, value=0.1, step=0.1)
+        sleep_min = st.number_input("Min jitter (sec)", min_value=0.0, max_value=10.0, value=0.1, step=0.1)
     with c5:
-        sleep_max = st.number_input("Max jitter per URL (sec)", min_value=0.0, max_value=20.0, value=0.6, step=0.1)
+        sleep_max = st.number_input("Max jitter (sec)", min_value=0.0, max_value=20.0, value=0.6, step=0.1)
 
-    st.button("Stop Crawl", on_click=request_stop, type="secondary")
+    st.button("Stop Crawl", on_click=request_stop)
 
 if not file:
-    st.info("Upload a file to begin. Your sheet must contain a column with product URLs.")
+    st.info("Upload a file to begin.")
     st.stop()
 
 # Load file
@@ -296,27 +337,13 @@ except Exception as e:
 st.subheader("Preview")
 st.dataframe(df.head(20), use_container_width=True)
 
-# URL column selection
 cols = list(df.columns)
-default_col = None
-for c in cols:
-    if str(c).strip().lower() in ["url", "product url", "product_url", "link", "pdp", "pdp url"]:
-        default_col = c
-        break
+url_col = st.selectbox("Select URL column", cols)
 
-url_col = st.selectbox(
-    "Select the column containing product URLs",
-    cols,
-    index=cols.index(default_col) if default_col in cols else 0
-)
-
-# Validate + dedupe
 raw_urls = df[url_col].fillna("").astype(str).tolist()
 normalized = [normalize_url(u) for u in raw_urls if str(u).strip()]
 
-valid_urls = []
-invalid_urls = []
-seen = set()
+valid_urls, invalid_urls, seen = [], [], set()
 
 for u in normalized:
     if not is_valid_tatacliq_url(u):
@@ -334,11 +361,11 @@ b.metric("Valid URLs", len(valid_urls))
 c.metric("Invalid/Skipped", len(invalid_urls))
 
 if invalid_urls:
-    with st.expander("View invalid URLs"):
+    with st.expander("Invalid URLs"):
         st.write(pd.DataFrame({"Invalid URL": invalid_urls}))
 
 if not valid_urls:
-    st.error("No valid TataCliq URLs found after validation. Please check your file.")
+    st.error("No valid URLs found.")
     st.stop()
 
 if validate_only:
@@ -346,7 +373,6 @@ if validate_only:
     st.dataframe(pd.DataFrame({"Valid URLs": valid_urls}), use_container_width=True)
     st.stop()
 
-# Start crawl
 if st.button("Start Crawl", type="primary"):
     headers = make_headers(cookie_text)
 
@@ -362,7 +388,6 @@ if st.button("Start Crawl", type="primary"):
     st.subheader("Extracted output")
     st.dataframe(out_df, use_container_width=True)
 
-    # Download Excel
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         out_df.to_excel(writer, index=False, sheet_name="Extracted")
@@ -374,10 +399,10 @@ if st.button("Start Crawl", type="primary"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # Download CSV
     st.download_button(
         label="Download Extracted Data (CSV)",
         data=out_df.to_csv(index=False).encode("utf-8"),
         file_name="tatacliq_extracted.csv",
         mime="text/csv",
     )
+
