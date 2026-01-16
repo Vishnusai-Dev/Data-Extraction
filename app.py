@@ -5,14 +5,19 @@ from bs4 import BeautifulSoup
 import time
 import random
 import threading
-import io   # ✅ ADD THIS
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 st.set_page_config(page_title="TataCliq Crawler", layout="wide")
 
-# ✅ ALWAYS initialize session_state keys at the top
-st.session_state.setdefault("stop_requested", False)
+# -----------------------------
+# Thread-safe stop signal
+# -----------------------------
+stop_event = threading.Event()
+
+def request_stop():
+    stop_event.set()
 
 # -----------------------------
 # Config / constants
@@ -32,25 +37,20 @@ BASE_HEADERS = {
 }
 
 # -----------------------------
-# Stop control
-# -----------------------------
-def request_stop():
-    st.session_state["stop_requested"] = True
-
-# -----------------------------
 # Networking helpers
 # -----------------------------
 def make_headers(cookie_text: str | None):
     headers = dict(BASE_HEADERS)
-    if cookie_text:
+    if cookie_text and cookie_text.strip():
         headers["cookie"] = cookie_text.strip()
     return headers
 
 def safe_get_json(url, headers, retry_count=3, timeout=25):
     last_err = None
     for attempt in range(1, retry_count + 1):
-        if st.session_state["stop_requested"]:
+        if stop_event.is_set():
             raise RuntimeError("Stopped by user")
+
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
             if r.status_code == 200:
@@ -58,14 +58,17 @@ def safe_get_json(url, headers, retry_count=3, timeout=25):
             last_err = f"HTTP {r.status_code}"
         except Exception as e:
             last_err = str(e)
+
         time.sleep(0.6 * attempt + random.random())
+
     raise RuntimeError(f"Failed after {retry_count} attempts. Last error: {last_err}")
 
 def safe_get_text(url, headers, retry_count=3, timeout=25):
     last_err = None
     for attempt in range(1, retry_count + 1):
-        if st.session_state["stop_requested"]:
+        if stop_event.is_set():
             raise RuntimeError("Stopped by user")
+
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
             if r.status_code == 200:
@@ -73,7 +76,9 @@ def safe_get_text(url, headers, retry_count=3, timeout=25):
             last_err = f"HTTP {r.status_code}"
         except Exception as e:
             last_err = str(e)
+
         time.sleep(0.6 * attempt + random.random())
+
     raise RuntimeError(f"Failed after {retry_count} attempts. Last error: {last_err}")
 
 # -----------------------------
@@ -99,13 +104,23 @@ def is_valid_tatacliq_url(u: str) -> bool:
         return False
 
 # -----------------------------
-# Parsing
+# Parsing helpers
 # -----------------------------
 def extract_product_id(url: str):
     import re
     m = re.search(r"(\d{6,})", str(url))
     return m.group(1) if m else None
 
+def flatten_list(x):
+    if x is None:
+        return ""
+    if isinstance(x, list):
+        return ", ".join([str(i) for i in x])
+    return str(x)
+
+# -----------------------------
+# TataCliq API calls
+# -----------------------------
 def get_details_data(product_id, headers, retry_count):
     url = f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetails/{product_id}?isPwa=true&isMobile=false"
     return safe_get_json(url, headers=headers, retry_count=retry_count)
@@ -122,14 +137,13 @@ def get_size_guide(product_url, headers, retry_count):
         return None
     return "Size guide available on page"
 
-def flatten_list(x):
-    if x is None:
-        return ""
-    if isinstance(x, list):
-        return ", ".join([str(i) for i in x])
-    return str(x)
-
+# -----------------------------
+# Crawl single URL
+# -----------------------------
 def crawl_single(url, headers, retry_count):
+    if stop_event.is_set():
+        return {"URL": url, "Error": "Stopped by user"}
+
     product_id = extract_product_id(url)
     if not product_id:
         return {"URL": url, "Error": "Could not extract product id"}
@@ -142,10 +156,11 @@ def crawl_single(url, headers, retry_count):
 
     out = {"URL": url, "Product ID": product_id}
 
+    # Defensive extraction
     try:
         product = None
         if isinstance(details, dict):
-            product = details.get("productDetails", {}).get("product") or details.get("product", None)
+            product = details.get("productDetails", {}).get("product") or details.get("product")
 
         if product:
             out["Brand"] = product.get("brand", "")
@@ -161,7 +176,7 @@ def crawl_single(url, headers, retry_count):
     try:
         pdp_product = None
         if isinstance(pdp, dict):
-            pdp_product = pdp.get("product", None) or pdp.get("productPdpDetails", {}).get("product", None)
+            pdp_product = pdp.get("product") or pdp.get("productPdpDetails", {}).get("product")
 
         if pdp_product:
             out["Description"] = pdp_product.get("description", "") or pdp_product.get("productDescription", "")
@@ -183,20 +198,19 @@ def crawl_single(url, headers, retry_count):
 # Crawl runner (multithread)
 # -----------------------------
 def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
-    st.session_state["stop_requested"] = False
+    stop_event.clear()
 
     results = []
     errors = 0
     total = len(urls)
+    completed = 0
+    lock = threading.Lock()
 
     progress = st.progress(0.0)
     status = st.empty()
 
-    completed = 0
-    lock = threading.Lock()
-
     def task(u):
-        if st.session_state["stop_requested"]:
+        if stop_event.is_set():
             return {"URL": u, "Error": "Stopped by user"}
         time.sleep(random.uniform(sleep_min, sleep_max))
         return crawl_single(u, headers, retry_count)
@@ -206,8 +220,10 @@ def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
 
         for fut in as_completed(futures):
             u = futures[fut]
-            if st.session_state["stop_requested"]:
+
+            if stop_event.is_set():
                 break
+
             try:
                 res = fut.result()
             except Exception as e:
@@ -216,12 +232,13 @@ def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
             with lock:
                 results.append(res)
                 completed += 1
-                if "Error" in res and res["Error"]:
+                if res.get("Error"):
                     errors += 1
+
                 progress.progress(min(completed / total, 1.0))
                 status.write(f"Completed {completed}/{total} | Errors: {errors}")
 
-    if st.session_state["stop_requested"]:
+    if stop_event.is_set():
         status.warning(f"Stopped by user. Completed {len(results)}/{total}.")
     else:
         status.success(f"Done. Total: {total} | Errors: {errors}")
@@ -236,7 +253,10 @@ st.caption("Upload URLs (Excel/CSV) → validate/dedupe → multithread crawl �
 
 with st.expander("Upload & settings", expanded=True):
     file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
-    cookie_text = st.text_area("Optional: Cookie header (if TataCliq blocks requests). Leave empty for public use.", height=110)
+    cookie_text = st.text_area(
+        "Optional: Cookie header (if TataCliq blocks requests). Leave empty for public use.",
+        height=110
+    )
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -254,93 +274,105 @@ with st.expander("Upload & settings", expanded=True):
 
     st.button("Stop Crawl", on_click=request_stop, type="secondary")
 
-if file:
-    try:
-        if file.name.lower().endswith(".csv"):
-            df = pd.read_csv(file)
-        else:
-            df = pd.read_excel(file)
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        st.stop()
-
-    st.subheader("Preview")
-    st.dataframe(df.head(20), use_container_width=True)
-
-    cols = list(df.columns)
-    default_col = None
-    for c in cols:
-        if str(c).strip().lower() in ["url", "product url", "product_url", "link", "pdp", "pdp url"]:
-            default_col = c
-            break
-    url_col = st.selectbox("Select the column containing product URLs", cols, index=cols.index(default_col) if default_col in cols else 0)
-
-    raw_urls = df[url_col].fillna("").astype(str).tolist()
-    normalized = [normalize_url(u) for u in raw_urls if str(u).strip()]
-
-    valid_urls = []
-    invalid_urls = []
-    seen = set()
-
-    for u in normalized:
-        if not is_valid_tatacliq_url(u):
-            invalid_urls.append(u)
-            continue
-        if u in seen:
-            continue
-        seen.add(u)
-        valid_urls.append(u)
-
-    st.markdown("### URL Validation Summary")
-    a, b, c = st.columns(3)
-    a.metric("Input rows", len(raw_urls))
-    b.metric("Valid URLs", len(valid_urls))
-    c.metric("Invalid/Skipped", len(invalid_urls))
-
-    if invalid_urls:
-        with st.expander("View invalid URLs"):
-            st.write(pd.DataFrame({"Invalid URL": invalid_urls}))
-
-    if not valid_urls:
-        st.error("No valid TataCliq URLs found after validation. Please check your file.")
-        st.stop()
-
-    if validate_only:
-        st.success("Validation + dedupe completed (crawl not started).")
-        st.dataframe(pd.DataFrame({"Valid URLs": valid_urls}), use_container_width=True)
-        st.stop()
-
-    if st.button("Start Crawl", type="primary"):
-        headers = make_headers(cookie_text if cookie_text.strip() else None)
-
-        out_df = run_crawl(
-            urls=valid_urls,
-            headers=headers,
-            retry_count=int(retry_count),
-            max_workers=int(max_workers),
-            sleep_min=float(sleep_min),
-            sleep_max=float(sleep_max),
-        )
-
-        st.subheader("Extracted output")
-        st.dataframe(out_df, use_container_width=True)
-
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-            out_df.to_excel(writer, index=False, sheet_name="Extracted")
-
-        st.download_button(
-            label="Download Extracted Data (Excel)",
-            data=buffer.getvalue(),
-            file_name="tatacliq_extracted.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        st.download_button(
-            label="Download Extracted Data (CSV)",
-            data=out_df.to_csv(index=False).encode("utf-8"),
-            file_name="tatacliq_extracted.csv",
-            mime="text/csv",
-        )
-else:
+if not file:
     st.info("Upload a file to begin. Your sheet must contain a column with product URLs.")
+    st.stop()
+
+# Load file
+try:
+    if file.name.lower().endswith(".csv"):
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
+except Exception as e:
+    st.error(f"Could not read file: {e}")
+    st.stop()
+
+st.subheader("Preview")
+st.dataframe(df.head(20), use_container_width=True)
+
+# URL column selection
+cols = list(df.columns)
+default_col = None
+for c in cols:
+    if str(c).strip().lower() in ["url", "product url", "product_url", "link", "pdp", "pdp url"]:
+        default_col = c
+        break
+
+url_col = st.selectbox(
+    "Select the column containing product URLs",
+    cols,
+    index=cols.index(default_col) if default_col in cols else 0
+)
+
+# Validate + dedupe
+raw_urls = df[url_col].fillna("").astype(str).tolist()
+normalized = [normalize_url(u) for u in raw_urls if str(u).strip()]
+
+valid_urls = []
+invalid_urls = []
+seen = set()
+
+for u in normalized:
+    if not is_valid_tatacliq_url(u):
+        invalid_urls.append(u)
+        continue
+    if u in seen:
+        continue
+    seen.add(u)
+    valid_urls.append(u)
+
+st.markdown("### URL Validation Summary")
+a, b, c = st.columns(3)
+a.metric("Input rows", len(raw_urls))
+b.metric("Valid URLs", len(valid_urls))
+c.metric("Invalid/Skipped", len(invalid_urls))
+
+if invalid_urls:
+    with st.expander("View invalid URLs"):
+        st.write(pd.DataFrame({"Invalid URL": invalid_urls}))
+
+if not valid_urls:
+    st.error("No valid TataCliq URLs found after validation. Please check your file.")
+    st.stop()
+
+if validate_only:
+    st.success("Validation + dedupe completed (crawl not started).")
+    st.dataframe(pd.DataFrame({"Valid URLs": valid_urls}), use_container_width=True)
+    st.stop()
+
+# Start crawl
+if st.button("Start Crawl", type="primary"):
+    headers = make_headers(cookie_text)
+
+    out_df = run_crawl(
+        urls=valid_urls,
+        headers=headers,
+        retry_count=int(retry_count),
+        max_workers=int(max_workers),
+        sleep_min=float(sleep_min),
+        sleep_max=float(sleep_max),
+    )
+
+    st.subheader("Extracted output")
+    st.dataframe(out_df, use_container_width=True)
+
+    # Download Excel
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        out_df.to_excel(writer, index=False, sheet_name="Extracted")
+
+    st.download_button(
+        label="Download Extracted Data (Excel)",
+        data=buffer.getvalue(),
+        file_name="tatacliq_extracted.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    # Download CSV
+    st.download_button(
+        label="Download Extracted Data (CSV)",
+        data=out_df.to_csv(index=False).encode("utf-8"),
+        file_name="tatacliq_extracted.csv",
+        mime="text/csv",
+    )
