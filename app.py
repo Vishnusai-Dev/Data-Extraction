@@ -1,424 +1,296 @@
-import streamlit as st
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
+import json
 import time
 import random
-import threading
-import io
 import re
-import json
-import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+import io
+import threading
+import concurrent.futures
+from collections import OrderedDict
 
-st.set_page_config(page_title="TataCliq Crawler", layout="wide")
+import requests
+import pandas as pd
+import streamlit as st
+from bs4 import BeautifulSoup
 
-# -----------------------------
-# Thread-safe stop signal
-# -----------------------------
+
+# ================= STOP CONTROL =================
 stop_event = threading.Event()
 
 def request_stop():
     stop_event.set()
 
-# -----------------------------
-# Config
-# -----------------------------
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
-BASE_HEADERS = {
-    "accept": "application/json, text/plain, */*",
-    "accept-language": "en-US,en;q=0.9",
-    "content-type": "application/json",
-    "user-agent": DEFAULT_UA,
-    "origin": "https://www.tatacliq.com",
-    "referer": "https://www.tatacliq.com/",
+# ================= HEADERS =================
+# NOTE: Cookie is mandatory in many cases for TataCliq
+HEADERS = {
+    'accept': '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'mode': 'no-cors',
+    'priority': 'u=1, i',
+    'referer': 'https://www.tatacliq.com/',
+    'sec-ch-ua': '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
 }
 
-def make_headers(cookie_text: str | None):
-    headers = dict(BASE_HEADERS)
+def add_cookie(headers: dict, cookie_text: str):
+    h = dict(headers)
     if cookie_text and cookie_text.strip():
-        headers["cookie"] = cookie_text.strip()
-    return headers
+        h["cookie"] = cookie_text.strip()
+    return h
 
-# -----------------------------
-# URL Validation
-# -----------------------------
-def normalize_url(u: str) -> str:
-    u = str(u).strip()
-    if not u:
-        return ""
-    if u.startswith("www."):
-        u = "https://" + u
-    return u
 
-def is_valid_tatacliq_url(u: str) -> bool:
-    try:
-        p = urlparse(u)
-        if p.scheme not in ("http", "https"):
-            return False
-        if "tatacliq.com" not in (p.netloc or ""):
-            return False
-        return True
-    except Exception:
-        return False
-
-# -----------------------------
-# Network helpers
-# -----------------------------
-def safe_get(url, headers, retry_count=3, timeout=25):
+# ================= RETRY HELPERS =================
+def safe_get(url, headers, params=None, retry_count=3, timeout=25):
     last_err = None
     for attempt in range(1, retry_count + 1):
         if stop_event.is_set():
             raise RuntimeError("Stopped by user")
+
         try:
-            r = requests.get(url, headers=headers, timeout=timeout)
-            return r
+            r = requests.get(url, headers=headers, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            last_err = f"HTTP {r.status_code}"
         except Exception as e:
             last_err = str(e)
-        time.sleep(0.6 * attempt + random.random())
-    raise RuntimeError(f"GET failed after {retry_count} attempts: {last_err}")
 
-# -----------------------------
-# Extraction helpers
-# -----------------------------
-def extract_mp_code(url: str):
-    """
-    Extract TataCliq SKU from URL.
-    Example: .../p-MP000000029530017 -> MP000000029530017
-    """
-    m = re.search(r"p-(MP\d+)", str(url), re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
-    m = re.search(r"(MP\d+)", str(url), re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
-    return None
+        time.sleep(0.7 * attempt + random.random())
 
-def safe_json_dumps(obj):
-    try:
-        return json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        try:
-            return json.dumps(str(obj), ensure_ascii=False)
-        except Exception:
-            return ""
+    raise RuntimeError(f"Failed after {retry_count} attempts. Last error: {last_err}")
 
-def extract_basic_meta(soup: BeautifulSoup):
-    out = {}
 
-    # Title
-    if soup.title:
-        out["Meta_Title"] = soup.title.get_text(strip=True)
+# ================= SIZE GUIDE HELPERS =================
+def format_size_header(raw_dim, unit=None):
+    if unit:
+        unit = "Inches" if unit.lower() == "in" else unit
+        return f"{raw_dim} ( {unit} )"
+    return raw_dim
 
-    # OG tags
-    def meta(prop):
-        t = soup.find("meta", {"property": prop})
-        return t.get("content") if t and t.get("content") else ""
 
-    out["Meta_OG_Title"] = meta("og:title")
-    out["Meta_OG_Description"] = meta("og:description")
-    out["Meta_OG_Image"] = meta("og:image")
+def get_size_guide(product_id, sizeGuideId, headers):
+    url = f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/{product_id}/sizeGuideChart"
+    params = {
+        "isPwa": "true",
+        "sizeGuideId": sizeGuideId,
+        "rootCategory": "Clothing"
+    }
 
-    # canonical
-    canon = soup.find("link", {"rel": "canonical"})
-    if canon and canon.get("href"):
-        out["Canonical"] = canon["href"]
+    res = safe_get(url, params=params, headers=headers)
+    js = res.json()
 
-    return out
+    unit_data = OrderedDict()
+    main_size = []
 
-# -----------------------------
-# Full PDP JSON extraction (main requirement)
-# -----------------------------
-def extract_pdp_json_from_html(url, headers, retry_count):
-    """
-    Extract embedded PDP JSON from:
-    1) __NEXT_DATA__
-    2) window.__PRELOADED_STATE__ / __APOLLO_STATE__
-    3) JSON-LD (fallback)
-    """
-    r = safe_get(url, headers=headers, retry_count=retry_count)
-    if r.status_code != 200:
-        return {"Error": f"HTML fetch failed HTTP {r.status_code}"}
+    for size_map in js["sizeGuideTabularWsData"]["unitList"]:
+        unit = size_map["displaytext"]
 
-    html = r.text
-    soup = BeautifulSoup(html, "html.parser")
+        if unit not in unit_data:
+            unit_data[unit] = OrderedDict()
 
-    out = extract_basic_meta(soup)
+        for size_name in size_map["sizeGuideList"]:
+            size = size_name["dimensionSize"]
+            if size not in main_size:
+                main_size.append(size)
 
-    # 1) __NEXT_DATA__
-    next_data = soup.find("script", {"id": "__NEXT_DATA__"})
-    if next_data and next_data.string:
-        try:
-            jd = json.loads(next_data.string)
-            out["PDP_Source"] = "__NEXT_DATA__"
-            out["PDP_JSON"] = safe_json_dumps(jd)
-            return out
-        except Exception:
-            pass
+            for dim in size_name["dimensionList"]:
+                d = dim["dimension"]
+                v = dim["dimensionValue"]
+                unit_data[unit].setdefault(d, []).append(v)
 
-    # 2) Preloaded state patterns in scripts
-    for s in soup.find_all("script"):
-        if not s.string:
-            continue
-        txt = s.string.strip()
+    final = OrderedDict()
+    final["Brand Size"] = main_size
 
-        if "__PRELOADED_STATE__" in txt or "__APOLLO_STATE__" in txt:
-            # attempt JSON object extraction
-            m = re.search(r"=\s*({.*})\s*;?\s*$", txt, re.DOTALL)
-            if m:
-                try:
-                    jd = json.loads(m.group(1))
-                    out["PDP_Source"] = "PRELOADED_STATE/APOLLO"
-                    out["PDP_JSON"] = safe_json_dumps(jd)
-                    return out
-                except Exception:
-                    pass
+    dims = set(unit_data.get("Cm", {})) | set(unit_data.get("In", {}))
 
-    # 3) JSON-LD fallback
-    scripts = soup.find_all("script", {"type": "application/ld+json"})
-    for s in scripts:
-        if not s.string:
-            continue
-        try:
-            jd = json.loads(s.string)
-            if isinstance(jd, dict) or isinstance(jd, list):
-                out["PDP_Source"] = "JSON-LD"
-                out["PDP_JSON"] = safe_json_dumps(jd)
-                return out
-        except Exception:
-            continue
+    for dim in dims:
+        cm = unit_data.get("Cm", {}).get(dim)
+        inch = unit_data.get("In", {}).get(dim)
 
-    out["PDP_Source"] = "NOT_FOUND"
-    out["PDP_JSON"] = ""
-    out["Error"] = "No embedded PDP JSON found in HTML"
-    return out
-
-# -----------------------------
-# Crawl one URL
-# -----------------------------
-def crawl_single(url, headers, retry_count):
-    if stop_event.is_set():
-        return {"URL": url, "Error": "Stopped by user"}
-
-    out = {"URL": url}
-    sku = extract_mp_code(url)
-    out["SKU"] = sku or ""
-
-    try:
-        pdp = extract_pdp_json_from_html(url, headers, retry_count)
-        out.update(pdp)
-
-        # If we got PDP_JSON, mark success
-        if out.get("PDP_JSON"):
-            out["Error"] = ""
+        if cm == inch:
+            final[format_size_header(dim)] = cm
         else:
-            out["Error"] = out.get("Error", "No PDP JSON")
+            if cm:
+                final[format_size_header(dim, "Cm")] = cm
+            if inch:
+                final[format_size_header(dim, "In")] = inch
+
+    final["measurement_image"] = js.get("imageURL")
+    return final
+
+
+# ================= PRODUCT EXTRACTION =================
+def extract_product(input_value: str, headers: dict, retry_count: int):
+    data = {}
+    sku = str(input_value).strip()
+
+    if not sku:
+        return {"Input": input_value, "Error": "Empty input"}
+
+    # supports url or sku
+    if "tatacliq.com" in sku:
+        product_id = sku.split("/p-")[-1]
+    else:
+        product_id = sku
+
+    api_url = f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetails/{product_id}?isPwa=true&isMDE=true&isDynamicVar=true"
+
+    try:
+        res = safe_get(api_url, headers=headers, retry_count=retry_count)
+        soup = BeautifulSoup(res.content, "html.parser")
+
+        # JSON returned inside <p> ... </p>
+        raw = str(soup)
+        if "<p>" not in raw:
+            return {"Input": input_value, "product_id": product_id, "Error": "No <p> JSON found (possible blocked request)"}
+
+        json_text = raw.split("<p>")[-1].split("</p>")[0]
+        json_data = json.loads(json_text)
+
     except Exception as e:
-        out["Error"] = str(e)
+        return {"Input": input_value, "product_id": product_id, "Error": str(e)}
 
-    return out
+    data["Input"] = input_value
+    data["product_id"] = product_id
+    data["productTitle"] = json_data.get("productTitle")
+    data["brandName"] = json_data.get("brandName")
+    data["productDescription"] = json_data.get("productDescription")
+    data["productColor"] = json_data.get("productColor")
+    data["styleNote"] = json_data.get("styleNote")
 
-# -----------------------------
-# Crawl runner (multi-thread)
-# -----------------------------
-def run_crawl(urls, headers, retry_count, max_workers, sleep_min, sleep_max):
-    stop_event.clear()
+    # Pricing
+    if json_data.get("mrpPrice"):
+        data["MRP"] = json_data["mrpPrice"].get("value")
+    if json_data.get("winningSellerPrice"):
+        data["Price"] = json_data["winningSellerPrice"].get("value")
+    if json_data.get("discount"):
+        data["Discount"] = json_data["discount"]
 
-    results = []
-    total = len(urls)
-    completed = 0
-    errors = 0
+    # Breadcrumbs
+    for i, c in enumerate(json_data.get("categoryHierarchy", [])):
+        data[f"Breadcrum_{i+1}"] = c.get("category_name")
 
-    lock = threading.Lock()
-    progress = st.progress(0.0)
-    status = st.empty()
+    # Details
+    for d in json_data.get("details", []):
+        k = d.get("key")
+        v = d.get("value")
+        if k:
+            data[k] = v
 
-    def task(u):
-        if stop_event.is_set():
-            return {"URL": u, "Error": "Stopped by user"}
-        time.sleep(random.uniform(sleep_min, sleep_max))
-        return crawl_single(u, headers, retry_count)
+    # Images
+    imgs = []
+    for g in json_data.get("galleryImagesList", []):
+        for k in g.get("galleryImages", []):
+            if k.get("key") == "superZoom":
+                imgs.append("https:" + k.get("value", ""))
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(task, u): u for u in urls}
+    for i, im in enumerate(imgs):
+        data[f"image_{i+1}"] = im
 
-        for fut in as_completed(futures):
-            u = futures[fut]
-            if stop_event.is_set():
-                break
+    # Manufacturer
+    if json_data.get("mfgDetails"):
+        for k, v in json_data["mfgDetails"].items():
+            data[k] = v[0]["value"] if isinstance(v, list) else v
 
-            try:
-                res = fut.result()
-            except Exception as e:
-                res = {"URL": u, "Error": str(e)}
+    # Size Guide
+    if json_data.get("sizeGuideId"):
+        try:
+            size_data = get_size_guide(product_id, json_data["sizeGuideId"], headers=headers)
+            data.update(size_data)
+        except Exception as e:
+            data["SizeGuide_Error"] = str(e)
 
-            with lock:
-                results.append(res)
-                completed += 1
-                if res.get("Error"):
-                    errors += 1
+    return data
 
-                progress.progress(min(completed / total, 1.0))
-                status.write(f"Completed {completed}/{total} | Errors: {errors}")
 
-    if stop_event.is_set():
-        status.warning(f"Stopped by user. Completed {len(results)}/{total}.")
+# ================= STREAMLIT UI =================
+st.title("TataCliq Product Data Extractor (Working API Version)")
+
+uploaded_file = st.file_uploader("Upload Excel/CSV File (URL or SKU column)", type=["xlsx", "csv"])
+
+cookie_text = st.text_area(
+    "Paste Cookie (Required for TataCliq access in most cases)",
+    height=130
+)
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    max_workers = st.number_input("Threads", min_value=1, max_value=20, value=8, step=1)
+with c2:
+    retry_count = st.number_input("Retry count", min_value=1, max_value=10, value=3, step=1)
+with c3:
+    validate_only = st.checkbox("Only validate inputs (no crawl)", value=False)
+
+st.button("Stop Extraction", on_click=request_stop)
+
+if uploaded_file:
+    if uploaded_file.name.lower().endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
     else:
-        status.success(f"Done. Total: {total} | Errors: {errors}")
+        df = pd.read_excel(uploaded_file)
 
-    return pd.DataFrame(results)
+    st.success(f"Loaded {len(df)} rows")
+    column = st.selectbox("Select column containing URL / SKU", df.columns)
 
-# -----------------------------
-# ZIP builder for PDP JSON files
-# -----------------------------
-def build_pdp_zip(df: pd.DataFrame):
-    """
-    Creates a zip in-memory:
-    - output_summary.csv
-    - pdp_json/<sku_or_row>.json (only when PDP_JSON exists)
-    """
-    mem_zip = io.BytesIO()
-    with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as z:
-        # summary CSV
-        z.writestr("output_summary.csv", df.to_csv(index=False))
+    # Validate + dedupe
+    inputs = df[column].dropna().astype(str).tolist()
+    inputs = [i.strip() for i in inputs if i.strip()]
+    inputs = list(dict.fromkeys(inputs))  # dedupe preserve order
 
-        # json files
-        for i, row in df.iterrows():
-            pdp_json = row.get("PDP_JSON", "")
-            if not isinstance(pdp_json, str) or not pdp_json.strip():
-                continue
+    st.write(f"Valid inputs after dedupe: {len(inputs)}")
 
-            sku = row.get("SKU", "")
-            name = sku if sku else f"row_{i+1}"
-            name = re.sub(r"[^A-Za-z0-9_\-]", "_", str(name))
+    if validate_only:
+        st.dataframe(pd.DataFrame({"Inputs": inputs}).head(50), use_container_width=True)
+        st.stop()
 
-            z.writestr(f"pdp_json/{name}.json", pdp_json)
+    if st.button("Start Extraction", type="primary"):
+        stop_event.clear()
+        headers = add_cookie(HEADERS, cookie_text)
 
-    mem_zip.seek(0)
-    return mem_zip.getvalue()
+        results = []
+        progress = st.progress(0.0)
+        status = st.empty()
 
-# -----------------------------
-# UI
-# -----------------------------
-st.title("TataCliq PDP Crawler")
-st.caption("Uploads → validates → downloads FULL PDP embedded JSON")
+        with st.spinner("Extracting data..."):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_workers)) as exe:
+                futures = {exe.submit(extract_product, inp, headers, int(retry_count)): inp for inp in inputs}
 
-with st.expander("Upload & settings", expanded=True):
-    file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
-    cookie_text = st.text_area("Optional Cookie header (if TataCliq blocks)", height=100)
+                done = 0
+                for fut in concurrent.futures.as_completed(futures):
+                    if stop_event.is_set():
+                        break
+                    res = fut.result()
+                    results.append(res)
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        retry_count = st.number_input("Retry count", min_value=1, max_value=10, value=3, step=1)
-    with c2:
-        max_workers = st.number_input("Threads", min_value=1, max_value=20, value=6, step=1)
-    with c3:
-        validate_only = st.checkbox("Only validate + dedupe", value=False)
+                    done += 1
+                    progress.progress(done / len(inputs))
+                    status.write(f"Completed {done}/{len(inputs)}")
 
-    c4, c5 = st.columns(2)
-    with c4:
-        sleep_min = st.number_input("Min jitter (sec)", min_value=0.0, max_value=10.0, value=0.1, step=0.1)
-    with c5:
-        sleep_max = st.number_input("Max jitter (sec)", min_value=0.0, max_value=20.0, value=0.6, step=0.1)
+        out_df = pd.DataFrame(results)
+        st.success("Extraction completed!")
 
-    st.button("Stop Crawl", on_click=request_stop)
+        st.dataframe(out_df.head(20), use_container_width=True)
 
-if not file:
-    st.info("Upload a file to begin.")
-    st.stop()
+        # Save to Excel in memory
+        out_xlsx = io.BytesIO()
+        with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
+            out_df.to_excel(writer, index=False, sheet_name="Output")
+        out_xlsx.seek(0)
 
-# load
-try:
-    if file.name.lower().endswith(".csv"):
-        df = pd.read_csv(file)
-    else:
-        df = pd.read_excel(file)
-except Exception as e:
-    st.error(f"Could not read file: {e}")
-    st.stop()
+        st.download_button(
+            label="Download Output Excel",
+            data=out_xlsx.getvalue(),
+            file_name="tatacliq_output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
-st.subheader("Preview")
-st.dataframe(df.head(20), use_container_width=True)
-
-cols = list(df.columns)
-url_col = st.selectbox("Select URL column", cols)
-
-raw_urls = df[url_col].fillna("").astype(str).tolist()
-normalized = [normalize_url(u) for u in raw_urls if str(u).strip()]
-
-valid_urls, invalid_urls, seen = [], [], set()
-
-for u in normalized:
-    if not is_valid_tatacliq_url(u):
-        invalid_urls.append(u)
-        continue
-    if u in seen:
-        continue
-    seen.add(u)
-    valid_urls.append(u)
-
-st.markdown("### URL Validation Summary")
-a, b, c = st.columns(3)
-a.metric("Input rows", len(raw_urls))
-b.metric("Valid URLs", len(valid_urls))
-c.metric("Invalid/Skipped", len(invalid_urls))
-
-if invalid_urls:
-    with st.expander("Invalid URLs"):
-        st.write(pd.DataFrame({"Invalid URL": invalid_urls}))
-
-if not valid_urls:
-    st.error("No valid TataCliq URLs found.")
-    st.stop()
-
-if validate_only:
-    st.success("Validation + dedupe completed (crawl not started).")
-    st.dataframe(pd.DataFrame({"Valid URLs": valid_urls}), use_container_width=True)
-    st.stop()
-
-if st.button("Start Crawl", type="primary"):
-    headers = make_headers(cookie_text)
-
-    out_df = run_crawl(
-        urls=valid_urls,
-        headers=headers,
-        retry_count=int(retry_count),
-        max_workers=int(max_workers),
-        sleep_min=float(sleep_min),
-        sleep_max=float(sleep_max),
-    )
-
-    st.subheader("Extracted output")
-    st.dataframe(out_df, use_container_width=True)
-
-    # Excel summary
-    excel_buffer = io.BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
-        out_df.drop(columns=["PDP_JSON"], errors="ignore").to_excel(writer, index=False, sheet_name="Summary")
-    excel_buffer.seek(0)
-
-    st.download_button(
-        label="Download Summary Excel (without PDP_JSON column)",
-        data=excel_buffer.getvalue(),
-        file_name="tatacliq_summary.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    # CSV full
-    st.download_button(
-        label="Download Full CSV (includes PDP_JSON)",
-        data=out_df.to_csv(index=False).encode("utf-8"),
-        file_name="tatacliq_output.csv",
-        mime="text/csv",
-    )
-
-    # ZIP with individual JSONs
-    zip_bytes = build_pdp_zip(out_df)
-    st.download_button(
-        label="Download PDP JSON ZIP (Recommended)",
-        data=zip_bytes,
-        file_name="tatacliq_pdp_json.zip",
-        mime="application/zip",
-    )
+        st.download_button(
+            label="Download Output CSV",
+            data=out_df.to_csv(index=False).encode("utf-8"),
+            file_name="tatacliq_output.csv",
+            mime="text/csv"
+        )
