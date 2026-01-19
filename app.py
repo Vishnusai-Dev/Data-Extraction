@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 # =========================================================
 # Streamlit Config
 # =========================================================
-st.set_page_config(page_title="TataCliq Crawler", layout="wide")
+st.set_page_config(page_title="TataCliq Data Extractor", layout="wide")
 
 
 # =========================================================
@@ -279,7 +279,7 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
 # =========================================================
 # Streamlit UI
 # =========================================================
-st.title("TataCliq Product Extractor (Notebook-Compatible)")
+st.title("TataCliq Product Extractor")
 st.caption("Uses your same API endpoint + logic, but supports both HTML <p> JSON and Raw JSON responses.")
 
 with st.expander("Cookie Instructions (Important)", expanded=True):
