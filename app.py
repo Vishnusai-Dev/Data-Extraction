@@ -5,6 +5,7 @@ import io
 import threading
 import concurrent.futures
 from collections import OrderedDict
+from copy import deepcopy
 
 import requests
 import pandas as pd
@@ -28,7 +29,7 @@ def request_stop():
 
 
 # =========================================================
-# Headers (same base as your working code)
+# Headers
 # =========================================================
 BASE_HEADERS = {
     "accept": "*/*",
@@ -46,10 +47,6 @@ BASE_HEADERS = {
 }
 
 def build_headers(cookie_text: str):
-    """
-    Cookie is often required for TataCliq.
-    But even without cookie, TataCliq may return raw JSON (mobile payload) sometimes.
-    """
     headers = dict(BASE_HEADERS)
     if cookie_text and cookie_text.strip():
         headers["cookie"] = cookie_text.strip()
@@ -57,7 +54,7 @@ def build_headers(cookie_text: str):
 
 
 # =========================================================
-# Retry helper
+# Safe Request with Retry
 # =========================================================
 def safe_get(url, headers, params=None, retry_count=3, timeout=25):
     last_err = None
@@ -71,14 +68,13 @@ def safe_get(url, headers, params=None, retry_count=3, timeout=25):
             return r
         except Exception as e:
             last_err = str(e)
-
-        time.sleep(0.7 * attempt + random.random())
+            time.sleep(0.7 * attempt + random.random())
 
     raise RuntimeError(f"Request failed after {retry_count} attempts. Last error: {last_err}")
 
 
 # =========================================================
-# Size Guide logic (from your working script)
+# Size Guide Helpers
 # =========================================================
 def format_size_header(raw_dim, unit=None):
     if unit:
@@ -95,7 +91,7 @@ def get_size_guide(product_id, sizeGuideId, headers, retry_count=3):
         "rootCategory": "Clothing"
     }
 
-    res = safe_get(url, params=params, headers=headers, retry_count=retry_count)
+    res = safe_get(url, headers=headers, params=params, retry_count=retry_count)
     js = res.json()
 
     unit_data = OrderedDict()
@@ -104,8 +100,7 @@ def get_size_guide(product_id, sizeGuideId, headers, retry_count=3):
     for size_map in js["sizeGuideTabularWsData"]["unitList"]:
         unit = size_map["displaytext"]
 
-        if unit not in unit_data:
-            unit_data[unit] = OrderedDict()
+        unit_data.setdefault(unit, OrderedDict())
 
         for size_name in size_map["sizeGuideList"]:
             size = size_name["dimensionSize"]
@@ -139,28 +134,21 @@ def get_size_guide(product_id, sizeGuideId, headers, retry_count=3):
 
 
 # =========================================================
-# Product extraction - FINAL robust version
+# PRODUCT EXTRACTION (UPDATED CRAWLER)
 # =========================================================
 def extract_product(input_value: str, headers: dict, retry_count: int):
-    """
-    Uses the SAME TataCliq API as your notebook:
-    /productDetails/{product_id}?isPwa=true&isMDE=true&isDynamicVar=true
-
-    But handles both response formats:
-    1) <p>{json}</p> (HTML wrapper)
-    2) raw JSON string: { ... }
-    """
     data = {}
     raw_input = str(input_value).strip()
 
     if not raw_input:
         return {"Input": input_value, "Error": "Empty input"}
 
-    # supports URL or SKU
     if "tatacliq.com" in raw_input:
         product_id = raw_input.split("/p-")[-1].strip()
     else:
         product_id = raw_input.strip()
+
+    product_id_upper = product_id.upper()
 
     api_url = (
         f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetails/"
@@ -174,42 +162,17 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
     try:
         res = safe_get(api_url, headers=headers, retry_count=retry_count)
         data["http_status"] = res.status_code
+        body = res.text.strip()
 
-        body = res.text or ""
-        body_stripped = body.strip()
-
-        # ----------------------------
-        # FORMAT A: Raw JSON directly
-        # ----------------------------
-        if body_stripped.startswith("{") and body_stripped.endswith("}"):
-            try:
-                json_data = json.loads(body_stripped)
-            except Exception as e:
-                data["blocked"] = True
-                data["Error"] = f"Raw JSON parse failed: {e}"
-                data["Raw_Response_Preview"] = body_stripped[:500]
-                return data
-
-        # ----------------------------
-        # FORMAT B: HTML with <p>{json}</p>
-        # ----------------------------
+        if body.startswith("{"):
+            json_data = json.loads(body)
         elif "<p>" in body:
-            json_text = body.split("<p>")[-1].split("</p>")[0].strip()
-            try:
-                json_data = json.loads(json_text)
-            except Exception as e:
-                data["blocked"] = True
-                data["Error"] = f"<p> JSON parse failed: {e}"
-                data["Raw_Response_Preview"] = json_text[:500]
-                return data
-
-        # ----------------------------
-        # UNKNOWN FORMAT (blocked/captcha/etc.)
-        # ----------------------------
+            soup = BeautifulSoup(body, "html.parser")
+            json_data = json.loads(soup.text)
         else:
             data["blocked"] = True
-            data["Error"] = "Unexpected response format (not raw JSON, not <p> JSON)"
-            data["Raw_Response_Preview"] = body_stripped[:500]
+            data["Error"] = "Unexpected response format"
+            data["Raw_Response_Preview"] = body[:500]
             return data
 
     except Exception as e:
@@ -217,17 +180,37 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
         data["Error"] = str(e)
         return data
 
-    # ------------------------------
-    # NORMAL EXTRACTION
-    # ------------------------------
     data["blocked"] = False
     data["Error"] = ""
 
-    data["productTitle"] = json_data.get("productTitle")
-    data["brandName"] = json_data.get("brandName")
-    data["productDescription"] = json_data.get("productDescription")
-    data["productColor"] = json_data.get("productColor")
-    data["styleNote"] = json_data.get("styleNote")
+    # Variant resolution
+    variant_found = False
+    if json_data.get("variantOptions"):
+        for v in json_data["variantOptions"]:
+            sizelink = v.get("sizelink")
+            colorlink = v.get("colorlink")
+            if sizelink and sizelink.get("productCode") == product_id_upper:
+                data.update({
+                    "product_url": "https://www.tatacliq.com" + sizelink.get("url", ""),
+                    "product_code": sizelink.get("productCode"),
+                    "Product_size": sizelink.get("size"),
+                    "color": colorlink.get("color") if colorlink else None,
+                    "color_hex": colorlink.get("colorHexCode") if colorlink else None
+                })
+                variant_found = True
+                break
+
+    if not variant_found:
+        data["product_url"] = "https://www.tatacliq.com" + json_data.get("seo", {}).get("alternateURL", "")
+        data["product_code"] = product_id
+
+    # Core fields
+    for f in [
+        "productTitle", "brandName", "productColor",
+        "productDescription", "styleNote",
+        "productListingId", "rootCategory"
+    ]:
+        data[f] = json_data.get(f)
 
     # Pricing
     if json_data.get("mrpPrice"):
@@ -243,33 +226,51 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
 
     # Details
     for d in json_data.get("details", []):
-        k = d.get("key")
-        v = d.get("value")
-        if k:
-            data[k] = v
+        if d.get("key"):
+            data[d["key"]] = d.get("value")
 
     # Images
     imgs = []
     for g in json_data.get("galleryImagesList", []):
         for k in g.get("galleryImages", []):
             if k.get("key") == "superZoom":
-                val = k.get("value", "")
-                if val:
-                    imgs.append("https:" + val)
-
+                imgs.append("https:" + k.get("value"))
     for i, im in enumerate(imgs):
         data[f"image_{i+1}"] = im
 
-    # Manufacturer details
+    # Manufacturer
     if json_data.get("mfgDetails"):
         for k, v in json_data["mfgDetails"].items():
             data[k] = v[0]["value"] if isinstance(v, list) else v
 
+    # Seller
+    data["Seller_name"] = json_data.get("winningSellerName")
+    data["Seller_address"] = json_data.get("winningSellerAddress")
+
+    # Classifications
+    for cls in json_data.get("classifications", []):
+        for spec in cls.get("specifications", []):
+            if spec.get("key"):
+                data[spec["key"]] = spec.get("value")
+
+    # Return / Refund
+    for i, r in enumerate(json_data.get("returnAndRefund", []), start=1):
+        if r.get("refundReturnItem"):
+            data[f"refundReturnInfo_{i}"] = r["refundReturnItem"]
+
+    # Available sizes
+    sizes = []
+    for g in json_data.get("variantGroup", []):
+        for s in g.get("sizeOptions", []):
+            if s.get("size") and s["size"] not in sizes:
+                sizes.append(s["size"])
+    if sizes:
+        data["Available Size"] = sizes
+
     # Size guide
     if json_data.get("sizeGuideId"):
         try:
-            size_data = get_size_guide(product_id, json_data["sizeGuideId"], headers=headers, retry_count=retry_count)
-            data.update(size_data)
+            data.update(get_size_guide(product_id, json_data["sizeGuideId"], headers, retry_count))
         except Exception as e:
             data["SizeGuide_Error"] = str(e)
 
@@ -280,69 +281,44 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
 # Streamlit UI
 # =========================================================
 st.title("TataCliq Product Extractor")
-st.caption("Uses your same API endpoint + logic, but supports both HTML <p> JSON and Raw JSON responses.")
 
-with st.expander("Cookie Instructions (Important)", expanded=True):
+with st.expander("Cookie Instructions", expanded=True):
     st.write(
         """
-**Why Cookie is useful?**
-TataCliq sometimes blocks cloud/bot traffic. Cookie improves success rate.
-
-**How to get cookie:**
-1. Open TataCliq in Chrome
-2. Press F12 → Network tab
-3. Reload
-4. Click a request → Headers → copy full `cookie:` value
-5. Paste below
+1. Open TataCliq in Chrome  
+2. Press F12 → Network → Reload  
+3. Click any request → Headers → Copy **cookie**  
+4. Paste below
 """
     )
 
-cookie_text = st.text_area("Paste cookie header here (optional but recommended)", height=160)
+cookie_text = st.text_area("Paste cookie header (recommended)", height=160)
 
-uploaded_file = st.file_uploader("Upload input file (Excel/CSV)", type=["xlsx", "csv"])
+uploaded_file = st.file_uploader("Upload Excel / CSV", type=["xlsx", "csv"])
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 with c1:
-    max_workers = st.number_input("Threads", min_value=1, max_value=30, value=8, step=1)
+    max_workers = st.number_input("Threads", 1, 30, 8)
 with c2:
-    retry_count = st.number_input("Retry count", min_value=1, max_value=10, value=3, step=1)
+    retry_count = st.number_input("Retry count", 1, 10, 3)
 with c3:
-    validate_only = st.checkbox("Only validate inputs", value=False)
-with c4:
-    show_failed_preview = st.checkbox("Show failed preview table", value=True)
+    validate_only = st.checkbox("Only validate inputs", False)
 
 st.button("Stop Extraction", on_click=request_stop)
 
 if not uploaded_file:
-    st.info("Upload a file to start.")
     st.stop()
 
-# read input
-try:
-    if uploaded_file.name.lower().endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
-except Exception as e:
-    st.error(f"Could not read file: {e}")
-    st.stop()
+df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith("xlsx") else pd.read_csv(uploaded_file)
 
-st.subheader("Input Preview")
 st.dataframe(df.head(20), use_container_width=True)
 
-col = st.selectbox("Select column containing TataCliq URL or product_id", df.columns)
-
-# build inputs + dedupe
-inputs = df[col].dropna().astype(str).tolist()
-inputs = [x.strip() for x in inputs if x and x.strip()]
-inputs = list(dict.fromkeys(inputs))
-
-st.write(f"Rows in file: {len(df)}")
-st.write(f"Valid inputs after dedupe: {len(inputs)}")
+col = st.selectbox("Column with TataCliq URL / ID", df.columns)
+inputs = list(dict.fromkeys(df[col].dropna().astype(str).str.strip().tolist()))
 
 if validate_only:
-    st.success("Validation completed.")
-    st.dataframe(pd.DataFrame({"Input": inputs}).head(100), use_container_width=True)
+    st.success("Validation done")
+    st.dataframe(pd.DataFrame({"Input": inputs}))
     st.stop()
 
 if st.button("Start Extraction", type="primary"):
@@ -351,54 +327,19 @@ if st.button("Start Extraction", type="primary"):
 
     results = []
     progress = st.progress(0.0)
-    status = st.empty()
 
-    with st.spinner("Extracting data..."):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_workers)) as exe:
-            futures = {exe.submit(extract_product, inp, headers, int(retry_count)): inp for inp in inputs}
-
-            done = 0
-            for fut in concurrent.futures.as_completed(futures):
-                if stop_event.is_set():
-                    break
-
-                res = fut.result()
-                results.append(res)
-
-                done += 1
-                progress.progress(done / len(inputs))
-                status.write(f"Completed {done}/{len(inputs)}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_workers)) as exe:
+        futures = [exe.submit(extract_product, i, headers, int(retry_count)) for i in inputs]
+        for idx, f in enumerate(concurrent.futures.as_completed(futures), 1):
+            results.append(f.result())
+            progress.progress(idx / len(inputs))
 
     out_df = pd.DataFrame(results)
-
-    st.success("Extraction completed!")
-    st.subheader("Output Preview")
     st.dataframe(out_df.head(50), use_container_width=True)
 
-    # show failures
-    if show_failed_preview:
-        failed = out_df[out_df.get("blocked", False) == True]
-        if len(failed) > 0:
-            st.warning(f"Failed/Unexpected format rows: {len(failed)}")
-            keep_cols = [c for c in ["Input", "product_id", "http_status", "Error", "Raw_Response_Preview"] if c in failed.columns]
-            st.dataframe(failed[keep_cols].head(50), use_container_width=True)
-
-    # Downloads
     out_xlsx = io.BytesIO()
     with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
-        out_df.to_excel(writer, index=False, sheet_name="Output")
-    out_xlsx.seek(0)
+        out_df.to_excel(writer, index=False)
 
-    st.download_button(
-        label="Download Output Excel",
-        data=out_xlsx.getvalue(),
-        file_name="tatacliq_output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-    st.download_button(
-        label="Download Output CSV",
-        data=out_df.to_csv(index=False).encode("utf-8"),
-        file_name="tatacliq_output.csv",
-        mime="text/csv"
-    )
+    st.download_button("Download Excel", out_xlsx.getvalue(), "tatacliq_output.xlsx")
+    st.download_button("Download CSV", out_df.to_csv(index=False).encode(), "tatacliq_output.csv")
