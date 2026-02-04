@@ -1,39 +1,30 @@
 import json
-import time
-import random
-import io
-import threading
+import requests
 import concurrent.futures
+import pandas as pd
+from bs4 import BeautifulSoup
 from collections import OrderedDict
 from copy import deepcopy
 from html import unescape
-import re
-
-import requests
-import pandas as pd
-import streamlit as st
-from bs4 import BeautifulSoup
+import time
+import random
 
 
 # =========================================================
-# Streamlit Config
+# CONFIG
 # =========================================================
-st.set_page_config(page_title="TataCliq Data Extractor", layout="wide")
+INPUT_EXCEL = "tatacliq.xlsx"
+INPUT_SHEET = "Sheet1"
+INPUT_COLUMN = "url"
+OUTPUT_EXCEL = "tatacliq_full_output.xlsx"
+MAX_WORKERS = 8
+RETRY_COUNT = 3
 
 
 # =========================================================
-# Stop Control (Thread Safe)
+# HEADERS (COOKIE REQUIRED)
 # =========================================================
-stop_event = threading.Event()
-
-def request_stop():
-    stop_event.set()
-
-
-# =========================================================
-# Headers
-# =========================================================
-BASE_HEADERS = {
+HEADERS = {
     "accept": "*/*",
     "accept-language": "en-US,en;q=0.9",
     "mode": "no-cors",
@@ -46,55 +37,52 @@ BASE_HEADERS = {
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+    # 🔴 IMPORTANT: paste your cookie here
+    "cookie": "PASTE_YOUR_COOKIE_HERE"
 }
 
-def build_headers(cookie_text: str):
-    headers = dict(BASE_HEADERS)
-    if cookie_text and cookie_text.strip():
-        headers["cookie"] = cookie_text.strip()
-    return headers
-
 
 # =========================================================
-# Helpers
+# HELPERS
 # =========================================================
-def safe_get(url, headers, params=None, retry_count=3, timeout=25):
-    last_err = None
-    for attempt in range(1, retry_count + 1):
-        if stop_event.is_set():
-            raise RuntimeError("Stopped by user")
+def safe_get(url, headers, params=None, retry=3, timeout=25):
+    for i in range(retry):
         try:
             return requests.get(url, headers=headers, params=params, timeout=timeout)
-        except Exception as e:
-            last_err = str(e)
-            time.sleep(0.6 * attempt)
-    raise RuntimeError(f"Request failed: {last_err}")
+        except:
+            time.sleep(0.6 * (i + 1))
+    return None
+
 
 def clean_html(text):
     return BeautifulSoup(unescape(str(text)), "html.parser").get_text(" ", strip=True)
 
 
-# =========================================================
-# Size Guide
-# =========================================================
 def format_size_header(raw_dim, unit=None):
     if unit:
         unit = "Inches" if unit.lower() == "in" else unit
         return f"{raw_dim} ( {unit} )"
     return raw_dim
 
-def get_size_guide(product_id, sizeGuideId, headers, retry_count=3):
+
+# =========================================================
+# SIZE GUIDE
+# =========================================================
+def get_size_guide(product_id, sizeGuideId):
+    res = safe_get(
+        f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/{product_id}/sizeGuideChart",
+        headers=HEADERS,
+        params={
+            "isPwa": "true",
+            "sizeGuideId": sizeGuideId,
+            "rootCategory": "Clothing"
+        }
+    )
+
+    if not res:
+        return OrderedDict()
+
     try:
-        res = safe_get(
-            f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/{product_id}/sizeGuideChart",
-            headers=headers,
-            params={
-                "isPwa": "true",
-                "sizeGuideId": sizeGuideId,
-                "rootCategory": "Clothing"
-            },
-            retry_count=retry_count
-        )
         js = res.json()
     except:
         return OrderedDict()
@@ -110,48 +98,48 @@ def get_size_guide(product_id, sizeGuideId, headers, retry_count=3):
             if size and size not in main_size:
                 main_size.append(size)
 
-            for dim in size_name.get("dimensionList", []):
-                unit_data[unit].setdefault(dim["dimension"], []).append(dim["dimensionValue"])
+            for d in size_name.get("dimensionList", []):
+                unit_data[unit].setdefault(d["dimension"], []).append(d["dimensionValue"])
 
-    final = OrderedDict()
+    out = OrderedDict()
     if main_size:
-        final["Brand Size"] = main_size
+        out["Brand Size"] = main_size
 
     for dim in set(unit_data.get("Cm", {})) | set(unit_data.get("In", {})):
         if unit_data.get("Cm", {}).get(dim) == unit_data.get("In", {}).get(dim):
-            final[format_size_header(dim)] = unit_data["Cm"][dim]
+            out[format_size_header(dim)] = unit_data["Cm"][dim]
         else:
             if unit_data.get("Cm", {}).get(dim):
-                final[format_size_header(dim, "Cm")] = unit_data["Cm"][dim]
+                out[format_size_header(dim, "Cm")] = unit_data["Cm"][dim]
             if unit_data.get("In", {}).get(dim):
-                final[format_size_header(dim, "In")] = unit_data["In"][dim]
+                out[format_size_header(dim, "In")] = unit_data["In"][dim]
 
     if js.get("imageURL"):
-        final["measurement_image"] = js["imageURL"]
+        out["measurement_image"] = js["imageURL"]
 
-    return final
+    return out
 
 
 # =========================================================
-# PRODUCT EXTRACTION (FULLY UPDATED)
+# MAIN CRAWLER
 # =========================================================
-def extract_product(input_value: str, headers: dict, retry_count: int):
-    data = {"Input": input_value}
+def crawl_product(url):
+    data = {"Input": url}
 
     try:
-        product_id = input_value.split("/p-")[-1] if "tatacliq.com" in input_value else input_value
-        product_id = product_id.strip()
-        product_id_upper = product_id.upper()
+        pid = url.split("/p-")[-1]
+        pid_u = pid.upper()
 
-        api_url = f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetails/{product_id_upper}?isPwa=true&isMDE=true&isDynamicVar=true"
-        data["api_url"] = api_url
+        res = safe_get(
+            f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetails/{pid_u}",
+            headers=HEADERS,
+            params={"isPwa": "true", "isMDE": "true", "isDynamicVar": "true"}
+        )
 
-        res = safe_get(api_url, headers=headers, retry_count=retry_count)
-        data["http_status"] = res.status_code
+        if not res:
+            return data
 
         json_data = res.json()
-        data["blocked"] = False
-        data["Error"] = ""
 
         # ---------------- Core
         for k in [
@@ -170,49 +158,64 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
             data[f"Breadcrum_{i}"] = c.get("category_name")
 
         # ---------------- Images
-        imgs = []
+        img_count = 1
         for g in json_data.get("galleryImagesList", []):
             for k in g.get("galleryImages", []):
                 if k.get("key") == "superZoom":
-                    imgs.append("https:" + k.get("value"))
-        for i, im in enumerate(imgs, 1):
-            data[f"image_{i}"] = im
+                    data[f"image_{img_count}"] = "https:" + k.get("value")
+                    img_count += 1
 
         # ---------------- Details
         for d in json_data.get("details", []):
             if d.get("key"):
                 data[d["key"]] = d.get("value")
 
-        # ---------------- Overview / Product Details (FIX FOR YOUR ISSUE)
-        for group in json_data.get("specificationGroup", []):
-            for spec in group.get("specifications", []):
-                if spec.get("key") and spec.get("value"):
-                    data[spec["key"]] = spec["value"]
+        # ---------------- specificationGroup (UI Overview)
+        for g in json_data.get("specificationGroup", []):
+            for s in g.get("specifications", []):
+                if s.get("key"):
+                    data[s["key"]] = s.get("value")
 
         # ---------------- detailsSection
-        for item in json_data.get("detailsSection", []):
-            if item.get("key") and item.get("value"):
-                data[item["key"]] = item["value"]
+        for i in json_data.get("detailsSection", []):
+            if i.get("key"):
+                data[i["key"]] = i.get("value")
 
         # ---------------- classificationList
-        for section in json_data.get("classificationList", []):
-            key = section.get("key")
-            value_block = section.get("value", {})
-            if "classificationList" in value_block:
-                for i in value_block["classificationList"]:
-                    if i.get("key"):
-                        data[i["key"]] = i.get("value")
-            elif "classificationValues" in value_block and key:
-                data[key] = ", ".join(value_block.get("classificationValues", []))
+        for sec in json_data.get("classificationList", []):
+            key = sec.get("key")
+            val = sec.get("value", {})
+            if "classificationList" in val:
+                for i in val["classificationList"]:
+                    data[i["key"]] = i["value"]
+            elif "classificationValues" in val:
+                data[key] = ", ".join(val["classificationValues"])
 
-        # ---------------- Composition
-        for i in json_data.get("otherIngredients", []):
-            if i.get("value"):
-                data["Composition"] = i["value"]
+        # ---------------- knowMore (features)
+        for i, k in enumerate(json_data.get("knowMore", []), 1):
+            data[f"Feature_{i}"] = k.get("knowMoreItem")
 
-        # ---------------- Seller
-        data["Seller_name"] = json_data.get("winningSellerName")
-        data["Seller_address"] = json_data.get("winningSellerAddress")
+        # ---------------- setInformation
+        if json_data.get("setInformation"):
+            for i in json_data["setInformation"].get("values", []):
+                data[i["key"]] = i["value"]
+
+        # ---------------- whatElseYouNeedtoKnow
+        for i in json_data.get("whatElseYouNeedtoKnow", []):
+            data[i["key"]] = i["value"]
+
+        # ---------------- ingredientDetails
+        for i in json_data.get("ingredientDetails", []):
+            data[i["key"]] = ", ".join(v["key"] for v in i.get("values", []))
+
+        # ---------------- primaryIngredients
+        for i in json_data.get("primaryIngredients", []):
+            data[i["key"]] = i["value"]
+
+        # ---------------- shortStorySmall
+        feats = sorted(json_data.get("shortStorySmall", []), key=lambda x: x.get("order", 0))
+        if feats:
+            data["additional_features"] = ", ".join(i["key"] for i in feats if i.get("key"))
 
         # ---------------- Ratings
         data["averageRating"] = json_data.get("averageRating")
@@ -220,82 +223,63 @@ def extract_product(input_value: str, headers: dict, retry_count: int):
         data["numberOfReviews"] = json_data.get("numberOfReviews")
 
         # ---------------- Customer Voice
+        cv = safe_get(
+            f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/{pid_u}/customerVoice",
+            headers=HEADERS
+        )
+        if cv:
+            for i in cv.json().get("customerVoiceData", []):
+                data[i["text"]] = i["value"]
+
+        # ---------------- Manufacturer / Packer
         try:
-            voice_res = safe_get(
-                f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/{product_id_upper}/customerVoice",
-                headers=headers,
-                retry_count=retry_count
+            brand = json_data.get("brandURL", "").split("c-")[-1]
+            cat = json_data["categoryHierarchy"][-1]["category_id"]
+
+            mfg = safe_get(
+                "https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/manufacturingdetails",
+                headers=HEADERS,
+                params={"brand": brand.upper(), "category": cat.upper()}
             )
-            for v in voice_res.json().get("customerVoiceData", []):
-                data[v["text"]] = v["value"]
+
+            mj = mfg.json()
+            if mj.get("manufacturer"):
+                data["manufacturer"] = mj["manufacturer"][0]["value"]
+            if mj.get("packer"):
+                data["packer"] = mj["packer"][0]["value"]
         except:
             pass
 
-        # ---------------- A+ Content
-        count = 1
-        for item in json_data.get("APlusContent", {}).get("productContent", []):
-            text_list = item.get("value", {}).get("textList")
-            if text_list:
-                cleaned = " ".join(clean_html(t) for t in text_list)
-                data[f"APlus_Content_{count}"] = cleaned
-                count += 1
-
-        # ---------------- Sizes
-        sizes = []
-        for g in json_data.get("variantGroup", []):
-            for s in g.get("sizeOptions", []):
-                if s.get("size") and s["size"] not in sizes:
-                    sizes.append(s["size"])
-        if sizes:
-            data["Available Size"] = sizes
-
         # ---------------- Size Guide
         if json_data.get("sizeGuideId"):
-            data.update(get_size_guide(product_id_upper, json_data["sizeGuideId"], headers, retry_count))
+            data.update(get_size_guide(pid_u, json_data["sizeGuideId"]))
+
+        # ---------------- A+ Content
+        count = 1
+        for i in json_data.get("APlusContent", {}).get("productContent", []):
+            txt = i.get("value", {}).get("textList")
+            if txt:
+                data[f"APlus_Content_{count}"] = " ".join(clean_html(t) for t in txt)
+                count += 1
 
         return data
 
     except Exception as e:
-        return {
-            "Input": input_value,
-            "blocked": True,
-            "Error": str(e)
-        }
+        data["Error"] = str(e)
+        return data
 
 
 # =========================================================
-# Streamlit UI
+# EXECUTION
 # =========================================================
-st.title("TataCliq Product Extractor (Full Coverage)")
+df = pd.read_excel(INPUT_EXCEL, INPUT_SHEET)
+urls = df[INPUT_COLUMN].dropna().tolist()
 
-cookie_text = st.text_area("Paste cookie header (recommended)", height=150)
-uploaded_file = st.file_uploader("Upload Excel / CSV", type=["xlsx", "csv"])
+all_data = []
 
-threads = st.number_input("Threads", 1, 30, 8)
-retry_count = st.number_input("Retry count", 1, 10, 3)
+with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+    for res in exe.map(crawl_product, urls):
+        all_data.append(deepcopy(res))
 
-st.button("Stop Extraction", on_click=request_stop)
-
-if uploaded_file:
-    df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith("xlsx") else pd.read_csv(uploaded_file)
-    col = st.selectbox("Column with TataCliq URL / ID", df.columns)
-    inputs = list(dict.fromkeys(df[col].dropna().astype(str).tolist()))
-
-    if st.button("Start Extraction", type="primary"):
-        headers = build_headers(cookie_text)
-        results = []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=int(threads)) as exe:
-            for idx, r in enumerate(exe.map(lambda x: extract_product(x, headers, retry_count), inputs), 1):
-                results.append(r)
-                st.progress(idx / len(inputs))
-
-        out_df = pd.DataFrame(results)
-        st.dataframe(out_df.head(50), use_container_width=True)
-
-        out_xlsx = io.BytesIO()
-        with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
-            out_df.to_excel(writer, index=False)
-
-        st.download_button("Download Excel", out_xlsx.getvalue(), "tatacliq_output.xlsx")
-        st.download_button("Download CSV", out_df.to_csv(index=False).encode(), "tatacliq_output.csv")
+pd.DataFrame(all_data).to_excel(OUTPUT_EXCEL, index=False)
+print("DONE:", OUTPUT_EXCEL)
