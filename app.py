@@ -1,30 +1,38 @@
 import json
-import requests
+import time
+import random
+import io
+import threading
 import concurrent.futures
-import pandas as pd
-from bs4 import BeautifulSoup
 from collections import OrderedDict
 from copy import deepcopy
 from html import unescape
-import time
-import random
+
+import requests
+import pandas as pd
+import streamlit as st
+from bs4 import BeautifulSoup
 
 
 # =========================================================
-# CONFIG
+# Streamlit Config
 # =========================================================
-INPUT_EXCEL = "tatacliq.xlsx"
-INPUT_SHEET = "Sheet1"
-INPUT_COLUMN = "url"
-OUTPUT_EXCEL = "tatacliq_full_output.xlsx"
-MAX_WORKERS = 8
-RETRY_COUNT = 3
+st.set_page_config(page_title="TataCliq Full Data Extractor", layout="wide")
 
 
 # =========================================================
-# HEADERS (COOKIE REQUIRED)
+# Stop Control
 # =========================================================
-HEADERS = {
+stop_event = threading.Event()
+
+def request_stop():
+    stop_event.set()
+
+
+# =========================================================
+# Headers
+# =========================================================
+BASE_HEADERS = {
     "accept": "*/*",
     "accept-language": "en-US,en;q=0.9",
     "mode": "no-cors",
@@ -37,16 +45,22 @@ HEADERS = {
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-    # 🔴 IMPORTANT: paste your cookie here
-    "cookie": "PASTE_YOUR_COOKIE_HERE"
 }
+
+def build_headers(cookie_text):
+    headers = dict(BASE_HEADERS)
+    if cookie_text.strip():
+        headers["cookie"] = cookie_text.strip()
+    return headers
 
 
 # =========================================================
-# HELPERS
+# Helpers
 # =========================================================
 def safe_get(url, headers, params=None, retry=3, timeout=25):
     for i in range(retry):
+        if stop_event.is_set():
+            raise RuntimeError("Stopped by user")
         try:
             return requests.get(url, headers=headers, params=params, timeout=timeout)
         except:
@@ -58,6 +72,9 @@ def clean_html(text):
     return BeautifulSoup(unescape(str(text)), "html.parser").get_text(" ", strip=True)
 
 
+# =========================================================
+# Size Guide
+# =========================================================
 def format_size_header(raw_dim, unit=None):
     if unit:
         unit = "Inches" if unit.lower() == "in" else unit
@@ -65,40 +82,32 @@ def format_size_header(raw_dim, unit=None):
     return raw_dim
 
 
-# =========================================================
-# SIZE GUIDE
-# =========================================================
-def get_size_guide(product_id, sizeGuideId):
+def get_size_guide(pid, sizeGuideId, headers):
     res = safe_get(
-        f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/{product_id}/sizeGuideChart",
-        headers=HEADERS,
-        params={
-            "isPwa": "true",
-            "sizeGuideId": sizeGuideId,
-            "rootCategory": "Clothing"
-        }
+        f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/{pid}/sizeGuideChart",
+        headers=headers,
+        params={"isPwa": "true", "sizeGuideId": sizeGuideId, "rootCategory": "Clothing"},
     )
-
     if not res:
-        return OrderedDict()
+        return {}
 
     try:
         js = res.json()
     except:
-        return OrderedDict()
+        return {}
 
     unit_data, main_size = OrderedDict(), []
 
-    for size_map in js.get("sizeGuideTabularWsData", {}).get("unitList", []):
-        unit = size_map.get("displaytext")
+    for u in js.get("sizeGuideTabularWsData", {}).get("unitList", []):
+        unit = u.get("displaytext")
         unit_data.setdefault(unit, OrderedDict())
 
-        for size_name in size_map.get("sizeGuideList", []):
-            size = size_name.get("dimensionSize")
+        for s in u.get("sizeGuideList", []):
+            size = s.get("dimensionSize")
             if size and size not in main_size:
                 main_size.append(size)
 
-            for d in size_name.get("dimensionList", []):
+            for d in s.get("dimensionList", []):
                 unit_data[unit].setdefault(d["dimension"], []).append(d["dimensionValue"])
 
     out = OrderedDict()
@@ -121,9 +130,9 @@ def get_size_guide(product_id, sizeGuideId):
 
 
 # =========================================================
-# MAIN CRAWLER
+# MAIN EXTRACTION
 # =========================================================
-def crawl_product(url):
+def extract_product(url, headers, retry):
     data = {"Input": url}
 
     try:
@@ -132,57 +141,55 @@ def crawl_product(url):
 
         res = safe_get(
             f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/productDetails/{pid_u}",
-            headers=HEADERS,
-            params={"isPwa": "true", "isMDE": "true", "isDynamicVar": "true"}
+            headers=headers,
+            params={"isPwa": "true", "isMDE": "true", "isDynamicVar": "true"},
+            retry=retry
         )
 
         if not res:
             return data
 
-        json_data = res.json()
+        js = res.json()
 
-        # ---------------- Core
+        # Core
         for k in [
             "productTitle","brandName","productColor","productDescription",
             "styleNote","productListingId","rootCategory"
         ]:
-            data[k] = json_data.get(k)
+            data[k] = js.get(k)
 
-        # ---------------- Pricing
-        data["MRP"] = json_data.get("mrpPrice", {}).get("value")
-        data["Price"] = json_data.get("winningSellerPrice", {}).get("value")
-        data["Discount"] = json_data.get("discount")
+        # Pricing
+        data["MRP"] = js.get("mrpPrice", {}).get("value")
+        data["Price"] = js.get("winningSellerPrice", {}).get("value")
+        data["Discount"] = js.get("discount")
 
-        # ---------------- Breadcrumbs
-        for i, c in enumerate(json_data.get("categoryHierarchy", []), 1):
+        # Breadcrumbs
+        for i, c in enumerate(js.get("categoryHierarchy", []), 1):
             data[f"Breadcrum_{i}"] = c.get("category_name")
 
-        # ---------------- Images
-        img_count = 1
-        for g in json_data.get("galleryImagesList", []):
+        # Images
+        idx = 1
+        for g in js.get("galleryImagesList", []):
             for k in g.get("galleryImages", []):
                 if k.get("key") == "superZoom":
-                    data[f"image_{img_count}"] = "https:" + k.get("value")
-                    img_count += 1
+                    data[f"image_{idx}"] = "https:" + k.get("value")
+                    idx += 1
 
-        # ---------------- Details
-        for d in json_data.get("details", []):
-            if d.get("key"):
-                data[d["key"]] = d.get("value")
+        # Details
+        for d in js.get("details", []):
+            data[d["key"]] = d["value"]
 
-        # ---------------- specificationGroup (UI Overview)
-        for g in json_data.get("specificationGroup", []):
+        # Overview / specificationGroup
+        for g in js.get("specificationGroup", []):
             for s in g.get("specifications", []):
-                if s.get("key"):
-                    data[s["key"]] = s.get("value")
+                data[s["key"]] = s["value"]
 
-        # ---------------- detailsSection
-        for i in json_data.get("detailsSection", []):
-            if i.get("key"):
-                data[i["key"]] = i.get("value")
+        # detailsSection
+        for i in js.get("detailsSection", []):
+            data[i["key"]] = i["value"]
 
-        # ---------------- classificationList
-        for sec in json_data.get("classificationList", []):
+        # classificationList
+        for sec in js.get("classificationList", []):
             key = sec.get("key")
             val = sec.get("value", {})
             if "classificationList" in val:
@@ -191,55 +198,39 @@ def crawl_product(url):
             elif "classificationValues" in val:
                 data[key] = ", ".join(val["classificationValues"])
 
-        # ---------------- knowMore (features)
-        for i, k in enumerate(json_data.get("knowMore", []), 1):
+        # knowMore → Features
+        for i, k in enumerate(js.get("knowMore", []), 1):
             data[f"Feature_{i}"] = k.get("knowMoreItem")
 
-        # ---------------- setInformation
-        if json_data.get("setInformation"):
-            for i in json_data["setInformation"].get("values", []):
-                data[i["key"]] = i["value"]
+        # Composition
+        for i in js.get("otherIngredients", []):
+            data["Composition"] = i.get("value")
 
-        # ---------------- whatElseYouNeedtoKnow
-        for i in json_data.get("whatElseYouNeedtoKnow", []):
-            data[i["key"]] = i["value"]
+        # Ratings
+        data["averageRating"] = js.get("averageRating")
+        data["ratingCount"] = js.get("ratingCount")
+        data["numberOfReviews"] = js.get("numberOfReviews")
 
-        # ---------------- ingredientDetails
-        for i in json_data.get("ingredientDetails", []):
-            data[i["key"]] = ", ".join(v["key"] for v in i.get("values", []))
-
-        # ---------------- primaryIngredients
-        for i in json_data.get("primaryIngredients", []):
-            data[i["key"]] = i["value"]
-
-        # ---------------- shortStorySmall
-        feats = sorted(json_data.get("shortStorySmall", []), key=lambda x: x.get("order", 0))
-        if feats:
-            data["additional_features"] = ", ".join(i["key"] for i in feats if i.get("key"))
-
-        # ---------------- Ratings
-        data["averageRating"] = json_data.get("averageRating")
-        data["ratingCount"] = json_data.get("ratingCount")
-        data["numberOfReviews"] = json_data.get("numberOfReviews")
-
-        # ---------------- Customer Voice
+        # Customer Voice
         cv = safe_get(
             f"https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/{pid_u}/customerVoice",
-            headers=HEADERS
+            headers=headers,
+            retry=retry
         )
         if cv:
             for i in cv.json().get("customerVoiceData", []):
                 data[i["text"]] = i["value"]
 
-        # ---------------- Manufacturer / Packer
+        # Manufacturer / Packer
         try:
-            brand = json_data.get("brandURL", "").split("c-")[-1]
-            cat = json_data["categoryHierarchy"][-1]["category_id"]
+            brand = js.get("brandURL", "").split("c-")[-1]
+            cat = js.get("categoryHierarchy")[-1]["category_id"]
 
             mfg = safe_get(
                 "https://www.tatacliq.com/marketplacewebservices/v2/mpl/products/manufacturingdetails",
-                headers=HEADERS,
-                params={"brand": brand.upper(), "category": cat.upper()}
+                headers=headers,
+                params={"brand": brand.upper(), "category": cat.upper()},
+                retry=retry
             )
 
             mj = mfg.json()
@@ -250,17 +241,17 @@ def crawl_product(url):
         except:
             pass
 
-        # ---------------- Size Guide
-        if json_data.get("sizeGuideId"):
-            data.update(get_size_guide(pid_u, json_data["sizeGuideId"]))
+        # Size Guide
+        if js.get("sizeGuideId"):
+            data.update(get_size_guide(pid_u, js["sizeGuideId"], headers))
 
-        # ---------------- A+ Content
-        count = 1
-        for i in json_data.get("APlusContent", {}).get("productContent", []):
-            txt = i.get("value", {}).get("textList")
-            if txt:
-                data[f"APlus_Content_{count}"] = " ".join(clean_html(t) for t in txt)
-                count += 1
+        # A+ Content
+        c = 1
+        for i in js.get("APlusContent", {}).get("productContent", []):
+            tl = i.get("value", {}).get("textList")
+            if tl:
+                data[f"APlus_Content_{c}"] = " ".join(clean_html(t) for t in tl)
+                c += 1
 
         return data
 
@@ -270,16 +261,38 @@ def crawl_product(url):
 
 
 # =========================================================
-# EXECUTION
+# STREAMLIT UI
 # =========================================================
-df = pd.read_excel(INPUT_EXCEL, INPUT_SHEET)
-urls = df[INPUT_COLUMN].dropna().tolist()
+st.title("TataCliq Full Data Extractor")
 
-all_data = []
+cookie_text = st.text_area("Paste cookie header", height=150)
+uploaded_file = st.file_uploader("Upload Excel / CSV", type=["xlsx", "csv"])
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-    for res in exe.map(crawl_product, urls):
-        all_data.append(deepcopy(res))
+threads = st.number_input("Threads", 1, 20, 8)
+retry_count = st.number_input("Retry count", 1, 10, 3)
 
-pd.DataFrame(all_data).to_excel(OUTPUT_EXCEL, index=False)
-print("DONE:", OUTPUT_EXCEL)
+st.button("Stop Extraction", on_click=request_stop)
+
+if uploaded_file:
+    df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith("xlsx") else pd.read_csv(uploaded_file)
+    col = st.selectbox("Select URL column", df.columns)
+    urls = df[col].dropna().astype(str).tolist()
+
+    if st.button("Start Extraction", type="primary"):
+        headers = build_headers(cookie_text)
+        results = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=int(threads)) as exe:
+            for idx, r in enumerate(exe.map(lambda u: extract_product(u, headers, retry_count), urls), 1):
+                results.append(r)
+                st.progress(idx / len(urls))
+
+        out_df = pd.DataFrame(results)
+        st.dataframe(out_df.head(50), use_container_width=True)
+
+        out_xlsx = io.BytesIO()
+        with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
+            out_df.to_excel(writer, index=False)
+
+        st.download_button("Download Excel", out_xlsx.getvalue(), "tatacliq_full_output.xlsx")
+        st.download_button("Download CSV", out_df.to_csv(index=False).encode(), "tatacliq_full_output.csv")
